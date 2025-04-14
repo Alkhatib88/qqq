@@ -25,7 +25,8 @@ Modifications made:
   • DataLoader uses num_workers=8 and pin_memory=True.
   • Automatic Mixed Precision (AMP) training is enabled using torch.cuda.amp.autocast and torch.cuda.amp.GradScaler.
   • cuDNN benchmark is enabled for optimized GPU performance.
-  • Non-blocking transfers help speed up data movement from CPU to GPU.
+  • Non-blocking transfers are used to speed up CPU-to-GPU data movement.
+  • GPU memory usage is limited to 90% of the total (10% headroom reserved).
 """
 
 import torch
@@ -158,7 +159,7 @@ def main():
         # 1. Load and prepare dataset
         dataset = load_and_prepare_datasets()
 
-        # 2. Build vocabulary and save to file
+        # 2. Build vocabulary and save it
         vocab = build_vocab(dataset, text_field="text", max_vocab_size=VOCAB_SIZE)
         with open("vocab.json", "w") as f:
             json.dump(vocab, f)
@@ -208,13 +209,14 @@ def main():
         model = TitanModel(config).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-        # Set GPU memory fraction (reserve 10% headroom)
+        # Fix: Specify a GPU index explicitly when setting memory fraction.
         if device.type == "cuda":
-            torch.cuda.set_per_process_memory_fraction(0.9, device=device)
+            device_index = torch.cuda.current_device()  # This returns an integer, e.g. 0
+            torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
             torch.cuda.empty_cache()
             print("GPU memory limited to 90% of total (10% reserved).")
 
-        # Setup Automatic Mixed Precision (AMP) using the old GradScaler API
+        # Setup Automatic Mixed Precision (AMP)
         scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
 
         # 7. Training loop
