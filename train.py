@@ -7,7 +7,6 @@ Training script for TitanModel on a RunPod H200 GPU (or CPU fallback).
 Loads multiple Hugging Face datasets:
   - Multimodal-Fatima/VQAv2_sample_train
   - Multimodal-Fatima/OxfordFlowers_test
-  - matlok/multimodal-python-copilot-training-overview
   - notbadai/python_functions_reasoning
   - espejelomar/code_search_net_python_10000_examples
   - reshinthadith/synthetic_program_synthesis_python_1M
@@ -15,17 +14,20 @@ Loads multiple Hugging Face datasets:
   - Sridevi/python_textbooks
   - nuprl/stack-dedup-python-testgen-starcoder-filter-v2
 
+(It attempts "matlok/multimodal-python-copilot-training-overview", but this dataset does not exist,
+so the script will skip it gracefully if it fails.)
+
 It builds a vocabulary, preprocesses samples, and trains TitanModel.
 Shows average loss, sample token accuracy, shapes of outputs, and a progress bar for each epoch.
 Training stops when sample token accuracy reaches 100% or the maximum number of epochs is reached.
 
 Modifications made:
   • DataLoader uses num_workers=8 and pin_memory=True.
-  • Automatic Mixed Precision (AMP) training is enabled.
-  • The script checks the PyTorch version to use the new AMP API if available, and falls back otherwise.
+  • Automatic Mixed Precision (AMP) training is enabled (with a safe fallback for older PyTorch).
   • cuDNN benchmark is enabled for optimized GPU performance.
   • Non-blocking data transfers are used.
   • GPU memory usage is limited to 90% (10% headroom reserved).
+
 """
 
 import torch
@@ -127,7 +129,7 @@ def load_and_prepare_datasets():
     dataset_ids = [
         "Multimodal-Fatima/VQAv2_sample_train",
         "Multimodal-Fatima/OxfordFlowers_test",
-        "matlok/multimodal-python-copilot-training-overview",
+        "matlok/multimodal-python-copilot-training-overview",  # known not to exist; will be skipped
         "notbadai/python_functions_reasoning",
         "espejelomar/code_search_net_python_10000_examples",
         "reshinthadith/synthetic_program_synthesis_python_1M",
@@ -138,6 +140,7 @@ def load_and_prepare_datasets():
     processed_datasets = []
     for ds_id in dataset_ids:
         try:
+            # If "OxfordFlowers" in ds_id, we use split="test", otherwise "train"
             split = "train" if "OxfordFlowers" not in ds_id else "test"
             ds = load_dataset(ds_id, split=f"{split}[:1%]")
             ds = ds.map(preprocess_sample)
@@ -212,20 +215,19 @@ def main():
 
         # Fix GPU memory fraction: specify GPU index explicitly (e.g., current device index)
         if device.type == "cuda":
-            device_index = torch.cuda.current_device()  # e.g., 0
+            device_index = torch.cuda.current_device()
             torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
             torch.cuda.empty_cache()
             print("GPU memory limited to 90% of total (10% reserved).")
 
-        # 7. Setup Automatic Mixed Precision (AMP) training with version check
-        from packaging import version
-        torch_version = version.parse(torch.__version__)
-        if torch_version >= version.parse("2.1.0"):
-            # New API available
-            scaler = torch.amp.GradScaler(device_type='cuda', enabled=(device.type == 'cuda'))
-            autocast_ctx = lambda: torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda'))
-        else:
-            # Fallback to legacy API
+        # 7. Setup Automatic Mixed Precision (AMP) training with safe fallback
+        #    (Remove device_type param to avoid the TypeError on older PyTorch versions.)
+        try:
+            # Attempt new approach (for PyTorch >= 2.1.0 nightlies)
+            scaler = torch.amp.GradScaler(device_type=None, enabled=(device.type == 'cuda'))
+            autocast_ctx = lambda: torch.amp.autocast(device_type=None, enabled=(device.type == 'cuda'))
+        except TypeError:
+            # Fallback for older versions (no device_type argument)
             scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
             autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=(device.type == 'cuda'))
 
