@@ -17,16 +17,15 @@ Loads multiple Hugging Face datasets:
 
 It builds a vocabulary, preprocesses samples, and trains TitanModel.
 Shows average loss, sample token accuracy, shapes of outputs, and a progress bar for each epoch.
-
-Training stops when sample token accuracy reaches 100% or the max 
-number of epochs is reached.
+Training stops when sample token accuracy reaches 100% or the maximum number of epochs is reached.
 
 Modifications made:
   • DataLoader uses num_workers=8 and pin_memory=True.
-  • Automatic Mixed Precision (AMP) training is enabled using torch.cuda.amp.autocast and torch.cuda.amp.GradScaler.
+  • Automatic Mixed Precision (AMP) training is enabled.
+  • The script checks the PyTorch version to use the new AMP API if available, and falls back otherwise.
   • cuDNN benchmark is enabled for optimized GPU performance.
-  • Non-blocking transfers are used to speed up CPU-to-GPU data movement.
-  • GPU memory usage is limited to 90% of the total (10% headroom reserved).
+  • Non-blocking data transfers are used.
+  • GPU memory usage is limited to 90% (10% headroom reserved).
 """
 
 import torch
@@ -40,8 +39,10 @@ from PIL import Image
 import json
 from collections import Counter
 import traceback
-from tqdm import tqdm  # progress bar
+from tqdm import tqdm
+import torch.nn as nn
 
+# Constants
 BATCH_SIZE = 4
 VOCAB_SIZE = 5000
 
@@ -153,7 +154,7 @@ def load_and_prepare_datasets():
 
 def main():
     try:
-        # Enable cuDNN benchmark for optimized GPU performance
+        # Enable cuDNN benchmarking for optimized GPU performance
         torch.backends.cudnn.benchmark = True
 
         # 1. Load and prepare dataset
@@ -164,8 +165,8 @@ def main():
         with open("vocab.json", "w") as f:
             json.dump(vocab, f)
         print("Vocabulary built and saved to vocab.json.")
-        
-        # 3. Create reverse vocabulary mapping
+
+        # 3. Create a reverse vocabulary mapping
         rev_vocab = {str(idx): word for word, idx in vocab.items()}
 
         # 4. Create a DataLoader with increased workers and pinned memory
@@ -178,7 +179,7 @@ def main():
             pin_memory=True
         )
 
-        # 5. Define model config (must match training config)
+        # 5. Define model configuration (must match training configuration)
         config = {
             "text_vocab_size": VOCAB_SIZE,
             "text_embed_dim": 512,
@@ -209,17 +210,26 @@ def main():
         model = TitanModel(config).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-        # Fix: Specify a GPU index explicitly when setting memory fraction.
+        # Fix GPU memory fraction: specify GPU index explicitly (e.g., current device index)
         if device.type == "cuda":
-            device_index = torch.cuda.current_device()  # This returns an integer, e.g. 0
+            device_index = torch.cuda.current_device()  # e.g., 0
             torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
             torch.cuda.empty_cache()
             print("GPU memory limited to 90% of total (10% reserved).")
 
-        # Setup Automatic Mixed Precision (AMP)
-        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+        # 7. Setup Automatic Mixed Precision (AMP) training with version check
+        from packaging import version
+        torch_version = version.parse(torch.__version__)
+        if torch_version >= version.parse("2.1.0"):
+            # New API available
+            scaler = torch.amp.GradScaler(device_type='cuda', enabled=(device.type == 'cuda'))
+            autocast_ctx = lambda: torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda'))
+        else:
+            # Fallback to legacy API
+            scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+            autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=(device.type == 'cuda'))
 
-        # 7. Training loop
+        # 8. Training loop
         model.train()
         num_epochs = 100
         epoch = 0
@@ -230,7 +240,7 @@ def main():
 
             for batch in tqdm(loader, desc=f"Epoch {epoch}/{num_epochs} Progress", leave=False):
                 optimizer.zero_grad()
-                with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                with autocast_ctx():
                     outputs = model(
                         text_input_ids=batch["text"].to(device, non_blocking=True),
                         image_input=batch["image"].to(device, non_blocking=True),
@@ -252,7 +262,7 @@ def main():
             avg_loss = running_loss / batch_count
             print(f"\nEpoch {epoch}/{num_epochs} - Average Loss: {avg_loss:.4f}")
 
-            # 8. Quick validation check
+            # 9. Quick validation check
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(loader))
@@ -272,7 +282,7 @@ def main():
                 print("Sample Input Text:  ", input_decoded)
                 print("Sample Target Text: ", target_decoded)
                 print("Sample Predicted:   ", predicted_decoded)
-                
+
                 correct = (predicted_tokens[0] == sample_target[0]).sum().item()
                 total = sample_target[0].numel()
                 acc = correct / total * 100.0
