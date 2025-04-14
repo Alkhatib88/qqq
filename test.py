@@ -82,9 +82,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # If using GPU, set the per-process memory fraction to reserve a headroom (e.g. 10% reserved)
+    # If using GPU, set the per-process memory fraction to reserve headroom (e.g., 10% reserved)
     if device.type == "cuda":
-        torch.cuda.set_per_process_memory_fraction(0.9, device=device)
+        device_index = torch.cuda.current_device()  # Get the current GPU index (e.g., 0)
+        torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
         torch.cuda.empty_cache()
         print("GPU memory limited to 90% of total (10% reserved for peak usage).")
 
