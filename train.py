@@ -23,7 +23,7 @@ number of epochs is reached.
 
 Modifications made:
   • DataLoader uses num_workers=8 and pin_memory=True.
-  • Automatic Mixed Precision (AMP) training is enabled using torch.amp.autocast and torch.amp.GradScaler.
+  • Automatic Mixed Precision (AMP) training is enabled using torch.cuda.amp.autocast and torch.cuda.amp.GradScaler.
   • cuDNN benchmark is enabled for optimized GPU performance.
   • Non-blocking transfers help speed up data movement from CPU to GPU.
 """
@@ -152,19 +152,19 @@ def load_and_prepare_datasets():
 
 def main():
     try:
-        # Enable cuDNN benchmark for optimized performance
+        # Enable cuDNN benchmark for optimized GPU performance
         torch.backends.cudnn.benchmark = True
 
-        # 1. Load/prepare dataset
+        # 1. Load and prepare dataset
         dataset = load_and_prepare_datasets()
 
-        # 2. Build vocabulary
+        # 2. Build vocabulary and save to file
         vocab = build_vocab(dataset, text_field="text", max_vocab_size=VOCAB_SIZE)
         with open("vocab.json", "w") as f:
             json.dump(vocab, f)
         print("Vocabulary built and saved to vocab.json.")
         
-        # 3. Build reverse vocabulary mapping
+        # 3. Create reverse vocabulary mapping
         rev_vocab = {str(idx): word for word, idx in vocab.items()}
 
         # 4. Create a DataLoader with increased workers and pinned memory
@@ -203,13 +203,19 @@ def main():
             ]
         }
 
-        # 6. Setup device: use GPU if available
+        # 6. Setup device and load model fully on GPU
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = TitanModel(config).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-        # Setup Automatic Mixed Precision (AMP) using new API syntax.
-        scaler = torch.amp.GradScaler(device_type='cuda', enabled=(device.type == 'cuda'))
+        # Set GPU memory fraction (reserve 10% headroom)
+        if device.type == "cuda":
+            torch.cuda.set_per_process_memory_fraction(0.9, device=device)
+            torch.cuda.empty_cache()
+            print("GPU memory limited to 90% of total (10% reserved).")
+
+        # Setup Automatic Mixed Precision (AMP) using the old GradScaler API
+        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
 
         # 7. Training loop
         model.train()
@@ -222,7 +228,7 @@ def main():
 
             for batch in tqdm(loader, desc=f"Epoch {epoch}/{num_epochs} Progress", leave=False):
                 optimizer.zero_grad()
-                with torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda')):
+                with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
                     outputs = model(
                         text_input_ids=batch["text"].to(device, non_blocking=True),
                         image_input=batch["image"].to(device, non_blocking=True),
@@ -244,7 +250,7 @@ def main():
             avg_loss = running_loss / batch_count
             print(f"\nEpoch {epoch}/{num_epochs} - Average Loss: {avg_loss:.4f}")
 
-            # 8. Quick validation-like check
+            # 8. Quick validation check
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(loader))
