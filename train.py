@@ -14,22 +14,21 @@ Loads multiple Hugging Face datasets:
   - Sridevi/python_textbooks
   - nuprl/stack-dedup-python-testgen-starcoder-filter-v2
 
-(It attempts "matlok/multimodal-python-copilot-training-overview", but this dataset does not exist,
-so the script will skip it gracefully if it fails.)
+(It attempts "matlok/multimodal-python-copilot-training-overview", but if missing it is skipped.)
 
-It builds a vocabulary, preprocesses samples, and trains TitanModel.
-Shows average loss, sample token accuracy, shapes of outputs, and a progress bar for each epoch.
-Training stops when sample token accuracy reaches 100% or the maximum number of epochs is reached.
+This script builds a vocabulary, preprocesses samples, and trains TitanModel.
+It monitors GPU utilization via nvidia-smi and adjusts the DataLoader batch size
+each epoch to try to “throttle” GPU usage toward a target level (e.g. 95%).
 
-Modifications made:
+Additional improvements:
   • DataLoader uses num_workers=8 and pin_memory=True.
-  • Automatic Mixed Precision (AMP) training is enabled (with a safe fallback for older PyTorch).
+  • Automatic Mixed Precision (AMP) training is enabled.
   • cuDNN benchmark is enabled for optimized GPU performance.
-  • Non-blocking data transfers are used.
-  • GPU memory usage is limited to 90% (10% headroom reserved).
-
+  • Non-blocking data transfers and per-process GPU memory settings are used.
+  • Out-of-memory errors are caught and the batch size is reduced if needed.
 """
 
+import math
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -43,11 +42,51 @@ from collections import Counter
 import traceback
 from tqdm import tqdm
 import torch.nn as nn
+import subprocess
+import sys
+import time
 
-# Constants
-BATCH_SIZE = 4
+# Constants for vocabulary/building and GPU throttling
+INITIAL_BATCH_SIZE = 4
 VOCAB_SIZE = 5000
+TARGET_GPU_UTILIZATION = 95   # Percent target utilization
+MAX_BATCH_SIZE = 64           # Maximum allowed batch size
 
+##############################
+# GPU Utilization Helper Functions
+##############################
+def get_gpu_utilization(gpu_index=0):
+    """Return current GPU utilization (%) by parsing nvidia-smi output."""
+    try:
+        result = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            encoding="utf-8"
+        )
+        # In case there are multiple GPUs, select the one at gpu_index
+        utilization_lines = result.strip().split("\n")
+        utilization = float(utilization_lines[gpu_index])
+        return utilization
+    except Exception as e:
+        print("Warning: Could not get GPU utilization:", e)
+        return 0.0
+
+def print_gpu_info(gpu_index=0):
+    """Print GPU properties and memory stats using both torch and nvidia-smi."""
+    try:
+        props = torch.cuda.get_device_properties(gpu_index)
+        print(f"--- GPU Information ---")
+        print(f"Name: {props.name}")
+        print(f"Total Memory: {props.total_memory / (1024**3):.2f} GB")
+        print(f"Multiprocessor Count: {props.multi_processor_count}")
+        util = get_gpu_utilization(gpu_index)
+        print(f"Current GPU Utilization (nvidia-smi): {util:.1f}%")
+        print(f"-----------------------")
+    except Exception as e:
+        print("Unable to get GPU properties:", e)
+
+##############################
+# Dataset, Tokenization, and Preprocessing
+##############################
 def build_vocab(dataset, text_field="text", max_vocab_size=VOCAB_SIZE):
     counter = Counter()
     for sample in dataset:
@@ -129,7 +168,7 @@ def load_and_prepare_datasets():
     dataset_ids = [
         "Multimodal-Fatima/VQAv2_sample_train",
         "Multimodal-Fatima/OxfordFlowers_test",
-        "matlok/multimodal-python-copilot-training-overview",  # known not to exist; will be skipped
+        "matlok/multimodal-python-copilot-training-overview",  # may not exist; skip if error
         "notbadai/python_functions_reasoning",
         "espejelomar/code_search_net_python_10000_examples",
         "reshinthadith/synthetic_program_synthesis_python_1M",
@@ -140,7 +179,7 @@ def load_and_prepare_datasets():
     processed_datasets = []
     for ds_id in dataset_ids:
         try:
-            # If "OxfordFlowers" in ds_id, we use split="test", otherwise "train"
+            # Use "test" split for OxfordFlowers, otherwise "train"
             split = "train" if "OxfordFlowers" not in ds_id else "test"
             ds = load_dataset(ds_id, split=f"{split}[:1%]")
             ds = ds.map(preprocess_sample)
@@ -155,15 +194,18 @@ def load_and_prepare_datasets():
     else:
         raise ValueError("No datasets loaded successfully.")
 
+##############################
+# Main Training Function
+##############################
 def main():
     try:
         # Enable cuDNN benchmarking for optimized GPU performance
         torch.backends.cudnn.benchmark = True
 
-        # 1. Load and prepare dataset
+        # 1. Load and prepare the dataset
         dataset = load_and_prepare_datasets()
 
-        # 2. Build vocabulary and save it
+        # 2. Build the vocabulary and save it
         vocab = build_vocab(dataset, text_field="text", max_vocab_size=VOCAB_SIZE)
         with open("vocab.json", "w") as f:
             json.dump(vocab, f)
@@ -172,17 +214,18 @@ def main():
         # 3. Create a reverse vocabulary mapping
         rev_vocab = {str(idx): word for word, idx in vocab.items()}
 
-        # 4. Create a DataLoader with increased workers and pinned memory
+        # 4. Setup initial DataLoader
+        current_batch_size = INITIAL_BATCH_SIZE
         loader = DataLoader(
             dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=current_batch_size,
             shuffle=True,
             collate_fn=lambda batch: collate_fn(batch, vocab),
             num_workers=8,
             pin_memory=True
         )
 
-        # 5. Define model configuration (must match training configuration)
+        # 5. Define the model configuration (must match training configuration)
         config = {
             "text_vocab_size": VOCAB_SIZE,
             "text_embed_dim": 512,
@@ -208,12 +251,14 @@ def main():
             ]
         }
 
-        # 6. Setup device and load model fully on GPU
+        # 6. Setup device and load the model fully on GPU
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            print_gpu_info(torch.cuda.current_device())
         model = TitanModel(config).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-        # Fix GPU memory fraction: specify GPU index explicitly (e.g., current device index)
+        # Limit GPU memory (reserve ~10% headroom)
         if device.type == "cuda":
             device_index = torch.cuda.current_device()
             torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
@@ -221,50 +266,94 @@ def main():
             print("GPU memory limited to 90% of total (10% reserved).")
 
         # 7. Setup Automatic Mixed Precision (AMP) training with safe fallback
-        #    (Remove device_type param to avoid the TypeError on older PyTorch versions.)
         try:
-            # Attempt new approach (for PyTorch >= 2.1.0 nightlies)
             scaler = torch.amp.GradScaler(device_type=None, enabled=(device.type == 'cuda'))
             autocast_ctx = lambda: torch.amp.autocast(device_type=None, enabled=(device.type == 'cuda'))
         except TypeError:
-            # Fallback for older versions (no device_type argument)
             scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
             autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=(device.type == 'cuda'))
 
-        # 8. Training loop
+        # 8. Training loop with dynamic batch size adjustment
         model.train()
         num_epochs = 100
         epoch = 0
         while epoch < num_epochs:
             epoch += 1
+
+            # Query GPU utilization and print info
+            current_util = get_gpu_utilization()
+            print(f"\nEpoch {epoch}: Current GPU Utilization: {current_util:.1f}%")
+            
+            # Adjust batch size if below target
+            if current_util < TARGET_GPU_UTILIZATION and device.type == "cuda":
+                # Calculate a scale factor and new batch size (capped by MAX_BATCH_SIZE)
+                factor = TARGET_GPU_UTILIZATION / (current_util + 1e-6)
+                new_bs = min(MAX_BATCH_SIZE, int(current_batch_size * factor))
+                if new_bs > current_batch_size:
+                    print(f"GPU utilization is low. Increasing batch size from {current_batch_size} to {new_bs}.")
+                    current_batch_size = new_bs
+                    loader = DataLoader(
+                        dataset,
+                        batch_size=current_batch_size,
+                        shuffle=True,
+                        collate_fn=lambda batch: collate_fn(batch, vocab),
+                        num_workers=8,
+                        pin_memory=True
+                    )
+            else:
+                print("No batch size adjustment necessary for this epoch.")
+
             running_loss = 0.0
             batch_count = 0
+            epoch_start_time = time.time()
 
             for batch in tqdm(loader, desc=f"Epoch {epoch}/{num_epochs} Progress", leave=False):
-                optimizer.zero_grad()
-                with autocast_ctx():
-                    outputs = model(
-                        text_input_ids=batch["text"].to(device, non_blocking=True),
-                        image_input=batch["image"].to(device, non_blocking=True),
-                        audio_input=batch["audio"].to(device, non_blocking=True),
-                        video_input=batch["video"].to(device, non_blocking=True),
-                        query_ids=batch["target"].to(device, non_blocking=True)
-                    )
-                    loss = F.cross_entropy(
-                        outputs["text_output_logits"].view(-1, config["text_vocab_size"]),
-                        batch["target"].to(device, non_blocking=True).view(-1)
-                    )
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                try:
+                    optimizer.zero_grad()
+                    with autocast_ctx():
+                        outputs = model(
+                            text_input_ids=batch["text"].to(device, non_blocking=True),
+                            image_input=batch["image"].to(device, non_blocking=True),
+                            audio_input=batch["audio"].to(device, non_blocking=True),
+                            video_input=batch["video"].to(device, non_blocking=True),
+                            query_ids=batch["target"].to(device, non_blocking=True)
+                        )
+                        loss = F.cross_entropy(
+                            outputs["text_output_logits"].view(-1, config["text_vocab_size"]),
+                            batch["target"].to(device, non_blocking=True).view(-1)
+                        )
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    running_loss += loss.item()
+                    batch_count += 1
 
-                running_loss += loss.item()
-                batch_count += 1
+                except RuntimeError as e:
+                    # If OOM error occurs, catch it, reduce the batch size, and continue
+                    if "out of memory" in str(e):
+                        print("Out-of-memory error caught. Reducing batch size.")
+                        current_batch_size = max(INITIAL_BATCH_SIZE, current_batch_size // 2)
+                        loader = DataLoader(
+                            dataset,
+                            batch_size=current_batch_size,
+                            shuffle=True,
+                            collate_fn=lambda batch: collate_fn(batch, vocab),
+                            num_workers=8,
+                            pin_memory=True
+                        )
+                        torch.cuda.empty_cache()
+                        break
+                    else:
+                        raise e
 
-            avg_loss = running_loss / batch_count
-            print(f"\nEpoch {epoch}/{num_epochs} - Average Loss: {avg_loss:.4f}")
+            epoch_duration = time.time() - epoch_start_time
+            if batch_count > 0:
+                avg_loss = running_loss / batch_count
+            else:
+                avg_loss = float('inf')
+            print(f"Epoch {epoch}/{num_epochs} completed in {epoch_duration:.1f}s - Average Loss: {avg_loss:.4f}")
 
-            # 9. Quick validation check
+            # 9. Quick validation check at end of epoch
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(loader))
@@ -291,7 +380,7 @@ def main():
                 print(f"Sample Token Accuracy: {acc:.2f}%")
             model.train()
 
-            print(f"Epoch {epoch} completed ({(epoch / num_epochs) * 100:.1f}% done)")
+            # Optional: if accuracy is perfect, stop training
             if acc >= 100.0:
                 print("Test passed 100%! Stopping training.")
                 break
@@ -301,6 +390,7 @@ def main():
     except Exception as e:
         print("An error occurred during training:")
         traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
