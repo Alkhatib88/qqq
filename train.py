@@ -4,17 +4,50 @@ train.py
 
 Training script for TitanModel on a RunPod H200 GPU (or CPU fallback).
 
-Loads multiple Hugging Face datasets:
-  - Multimodal-Fatima/VQAv2_sample_train
-  - Multimodal-Fatima/OxfordFlowers_test
-  - notbadai/python_functions_reasoning
-  - espejelomar/code_search_net_python_10000_examples
-  - reshinthadith/synthetic_program_synthesis_python_1M
-  - suriyagunasekar/stackoverflow-python-with-meta-data
-  - Sridevi/python_textbooks
-  - nuprl/stack-dedup-python-testgen-starcoder-filter-v2
-
-(It attempts "matlok/multimodal-python-copilot-training-overview", but if missing it is skipped.)
+Loads multiple Hugging Face datasets including:
+  • Multimodal-Fatima/VQAv2_sample_train
+  • Multimodal-Fatima/OxfordFlowers_test
+  • notbadai/python_functions_reasoning
+  • espejelomar/code_search_net_python_10000_examples
+  • reshinthadith/synthetic_program_synthesis_python_1M
+  • suriyagunasekar/stackoverflow-python-with-meta-data
+  • Sridevi/python_textbooks
+  • nuprl/stack-dedup-python-testgen-starcoder-filter-v2
+—and many reasoning/chain-of-thought datasets:
+  • nvidia/OpenCodeReasoning
+  • nvidia/Llama-Nemotron-Post-Training-Dataset
+  • open-thoughts/OpenThoughts2-1M
+  • glaiveai/reasoning-v1-20m
+  • emilbiju/Execution-Dagger-Data-Math-think
+  • wikimedia/wikipedia
+  • FreedomIntelligence/medical-o1-reasoning-SFT
+  • facebook/natural_reasoning
+  • KingNish/reasoning-base-20k
+  • ProlificAI/social-reasoning-rlhf
+  • dvilasuero/natural-science-reasoning
+  • smirki/UI_Reasoning_Dataset
+  • reasoning-machines/gsm-hard
+  • di-zhang-fdu/R1-Vision-Reasoning-Instructions
+  • lightblue/reasoning-multilingual-R1-Llama-70B-train
+  • prithivMLmods/Deepthink-Reasoning
+  • Nan-Do/SPP_30K_reasoning_tasks
+  • davanstrien/reasoning-required
+  • antiven0m/physical-reasoning-dpo
+  • isaiahbjork/cot-logic-reasoning
+  • efficientscaling/Z1-Code-Reasoning-107K
+  • iamtarun/python_code_instructions_18k_alpaca
+  • flytech/python-codes-25k
+  • Vezora/Tested-143k-Python-Alpaca
+  • matlok/multimodal-python-copilot-training-overview
+  • semeru/code-text-python
+  • microsoft/LCC_python
+  • thomwolf/github-python
+  • Jofthomas/hermes-function-calling-thinking-V1
+  • UCSC-VLAA/VLAA-Thinking
+  • minchyeom/thinker-formatted
+  • fhai50032/GPQA-Thinking-O1
+  • ThinkAgents/Function-Calling-with-Chain-of-Thoughts
+  • Salesforce/xlam-function-calling-60k
 
 This script builds a vocabulary, preprocesses samples, and trains TitanModel.
 It monitors GPU utilization via nvidia-smi and adjusts the DataLoader batch size
@@ -26,6 +59,7 @@ Additional improvements:
   • cuDNN benchmark is enabled for optimized GPU performance.
   • Non-blocking data transfers and per-process GPU memory settings are used.
   • Out-of-memory errors are caught and the batch size is reduced if needed.
+  • Extra reasoning fields (e.g. thinking, task, function call) are appended to training text.
 """
 
 import math
@@ -49,7 +83,7 @@ import time
 # Constants for vocabulary/building and GPU throttling
 INITIAL_BATCH_SIZE = 4
 VOCAB_SIZE = 5000
-TARGET_GPU_UTILIZATION = 95   # Percent target utilization
+TARGET_GPU_UTILIZATION = 95   # Target GPU utilization (percent)
 MAX_BATCH_SIZE = 64           # Maximum allowed batch size
 
 ##############################
@@ -62,7 +96,6 @@ def get_gpu_utilization(gpu_index=0):
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
             encoding="utf-8"
         )
-        # In case there are multiple GPUs, select the one at gpu_index
         utilization_lines = result.strip().split("\n")
         utilization = float(utilization_lines[gpu_index])
         return utilization
@@ -71,7 +104,7 @@ def get_gpu_utilization(gpu_index=0):
         return 0.0
 
 def print_gpu_info(gpu_index=0):
-    """Print GPU properties and memory stats using both torch and nvidia-smi."""
+    """Print GPU properties and memory stats using torch and nvidia-smi."""
     try:
         props = torch.cuda.get_device_properties(gpu_index)
         print(f"--- GPU Information ---")
@@ -111,22 +144,37 @@ def decode_tokens(token_ids, rev_vocab):
     return " ".join(tokens)
 
 def preprocess_sample(sample):
+    """
+    Process each sample to create a uniform format.
+    Searches for common text keys and, if available, extra fields like
+    'thinking', 'task', or 'function_call(s)' are appended to the main text.
+    """
     out = {}
-    text_keys = ["question", "caption", "text", "code"]
-    for key in text_keys:
+    # Find the primary text from one of several common keys.
+    for key in ["question", "caption", "text", "code"]:
         if key in sample and sample[key] is not None:
             out["text"] = sample[key]
             break
     if "text" not in out:
         out["text"] = ""
+    # Use answer if available; otherwise, repeat text as target.
     if "answer" in sample and sample["answer"]:
         out["target"] = sample["answer"]
     else:
         out["target"] = out["text"]
+    # Pass along image data, if any.
     if "image" in sample and sample["image"] is not None:
         out["image"] = sample["image"]
     else:
         out["image"] = None
+
+    # Append any extra reasoning fields if they exist.
+    extra_fields = []
+    for field in ["thinking", "task", "function_call", "function_calls"]:
+        if field in sample and sample[field]:
+            extra_fields.append(f"<{field.upper()}> {sample[field]}")
+    if extra_fields:
+        out["text"] += " " + " ".join(extra_fields)
     return out
 
 image_transform = transforms.Compose([
@@ -165,21 +213,57 @@ def collate_fn(batch, vocab):
     }
 
 def load_and_prepare_datasets():
+    # Original dataset IDs plus additional reasoning/chain-of-thought datasets.
     dataset_ids = [
         "Multimodal-Fatima/VQAv2_sample_train",
         "Multimodal-Fatima/OxfordFlowers_test",
-        "matlok/multimodal-python-copilot-training-overview",  # may not exist; skip if error
+        "matlok/multimodal-python-copilot-training-overview",  # may not exist; will be skipped if error
         "notbadai/python_functions_reasoning",
         "espejelomar/code_search_net_python_10000_examples",
         "reshinthadith/synthetic_program_synthesis_python_1M",
         "suriyagunasekar/stackoverflow-python-with-meta-data",
         "Sridevi/python_textbooks",
-        "nuprl/stack-dedup-python-testgen-starcoder-filter-v2"
+        "nuprl/stack-dedup-python-testgen-starcoder-filter-v2",
+        # New reasoning/chain-of-thought datasets:
+        "nvidia/OpenCodeReasoning",
+        "nvidia/Llama-Nemotron-Post-Training-Dataset",
+        "open-thoughts/OpenThoughts2-1M",
+        "glaiveai/reasoning-v1-20m",
+        "emilbiju/Execution-Dagger-Data-Math-think",
+        "wikimedia/wikipedia",
+        "FreedomIntelligence/medical-o1-reasoning-SFT",
+        "facebook/natural_reasoning",
+        "KingNish/reasoning-base-20k",
+        "ProlificAI/social-reasoning-rlhf",
+        "dvilasuero/natural-science-reasoning",
+        "smirki/UI_Reasoning_Dataset",
+        "reasoning-machines/gsm-hard",
+        "di-zhang-fdu/R1-Vision-Reasoning-Instructions",
+        "lightblue/reasoning-multilingual-R1-Llama-70B-train",
+        "prithivMLmods/Deepthink-Reasoning",
+        "Nan-Do/SPP_30K_reasoning_tasks",
+        "davanstrien/reasoning-required",
+        "antiven0m/physical-reasoning-dpo",
+        "isaiahbjork/cot-logic-reasoning",
+        "efficientscaling/Z1-Code-Reasoning-107K",
+        "iamtarun/python_code_instructions_18k_alpaca",
+        "flytech/python-codes-25k",
+        "Vezora/Tested-143k-Python-Alpaca",
+        "matlok/multimodal-python-copilot-training-overview",
+        "semeru/code-text-python",
+        "microsoft/LCC_python",
+        "thomwolf/github-python",
+        "Jofthomas/hermes-function-calling-thinking-V1",
+        "UCSC-VLAA/VLAA-Thinking",
+        "minchyeom/thinker-formatted",
+        "fhai50032/GPQA-Thinking-O1",
+        "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
+        "Salesforce/xlam-function-calling-60k"
     ]
     processed_datasets = []
     for ds_id in dataset_ids:
         try:
-            # Use "test" split for OxfordFlowers, otherwise "train"
+            # For some datasets, if "OxfordFlowers" is mentioned, use split "test"; otherwise "train".
             split = "train" if "OxfordFlowers" not in ds_id else "test"
             ds = load_dataset(ds_id, split=f"{split}[:1%]")
             ds = ds.map(preprocess_sample)
@@ -284,9 +368,8 @@ def main():
             current_util = get_gpu_utilization()
             print(f"\nEpoch {epoch}: Current GPU Utilization: {current_util:.1f}%")
             
-            # Adjust batch size if below target
+            # Adjust batch size if GPU utilization is below target
             if current_util < TARGET_GPU_UTILIZATION and device.type == "cuda":
-                # Calculate a scale factor and new batch size (capped by MAX_BATCH_SIZE)
                 factor = TARGET_GPU_UTILIZATION / (current_util + 1e-6)
                 new_bs = min(MAX_BATCH_SIZE, int(current_batch_size * factor))
                 if new_bs > current_batch_size:
@@ -329,7 +412,7 @@ def main():
                     batch_count += 1
 
                 except RuntimeError as e:
-                    # If OOM error occurs, catch it, reduce the batch size, and continue
+                    # Catch out-of-memory errors, reduce batch size, and continue.
                     if "out of memory" in str(e):
                         print("Out-of-memory error caught. Reducing batch size.")
                         current_batch_size = max(INITIAL_BATCH_SIZE, current_batch_size // 2)
@@ -347,13 +430,10 @@ def main():
                         raise e
 
             epoch_duration = time.time() - epoch_start_time
-            if batch_count > 0:
-                avg_loss = running_loss / batch_count
-            else:
-                avg_loss = float('inf')
+            avg_loss = running_loss / batch_count if batch_count > 0 else float('inf')
             print(f"Epoch {epoch}/{num_epochs} completed in {epoch_duration:.1f}s - Average Loss: {avg_loss:.4f}")
 
-            # 9. Quick validation check at end of epoch
+            # 9. Quick validation check at epoch end
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(loader))
@@ -380,7 +460,6 @@ def main():
                 print(f"Sample Token Accuracy: {acc:.2f}%")
             model.train()
 
-            # Optional: if accuracy is perfect, stop training
             if acc >= 100.0:
                 print("Test passed 100%! Stopping training.")
                 break
