@@ -17,10 +17,10 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
+# Try to import tqdm for progress display; if not available, fallback to an iterator
 try:
     from tqdm import tqdm
 except ImportError:
-    # Fallback: simply return the iterable (no dynamic progress display)
     def tqdm(iterable, **kwargs):
         return iterable
 
@@ -39,19 +39,19 @@ def train_model(model, dataloader, num_epochs, learning_rate, device):
         batch_counter = 0
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
         for batch in progress_bar:
-            # Move each tensor to the appropriate device
+            # Move each tensor to the appropriate device using non_blocking transfers
             for key in batch:
                 batch[key] = batch[key].to(device, non_blocking=True)
             optimizer.zero_grad()
             with autocast(device_type="cuda"):
                 outputs = model(batch)
                 loss = 0.0
-                # Text branch loss (cross-entropy)
+                # Compute text branch loss using cross-entropy loss
                 if "text_out" in outputs and "text" in batch:
-                    logits = outputs["text_out"]  # shape (B, seq_len, vocab_size)
+                    logits = outputs["text_out"]  # (B, seq_len, vocab_size)
                     target = batch["text"]
                     loss += criterion(logits.view(-1, logits.size(-1)), target.view(-1))
-                # Reconstruction losses for audio, image, and video
+                # Compute reconstruction losses for audio, image, and video branches
                 if "audio_out" in outputs:
                     loss += nn.MSELoss()(outputs["audio_out"], batch["audio"])
                 if "image_out" in outputs:
@@ -70,7 +70,7 @@ def train_model(model, dataloader, num_epochs, learning_rate, device):
     torch.save(model.state_dict(), "unified_model.pt")
     print("Training complete. Model saved as 'unified_model.pt'.")
     
-    # Demonstrate function calls: build and execute a script.
+    # Demonstrate function calls: build and execute a script
     build_result = model.call_function("build_script", "example_script.py")
     execute_result = model.call_function("execute_script", "example_script.py")
     print("Function Call Demo:")
@@ -84,9 +84,9 @@ def train_model(model, dataloader, num_epochs, learning_rate, device):
 
 def main():
     config = get_default_config()
-    # GPU auto-detection and management:
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        # Create an explicit device with index 0
+        device = torch.device("cuda:0")
         gpu_name = torch.cuda.get_device_name(device)
         gpu_props = torch.cuda.get_device_properties(device)
         total_memory_gb = gpu_props.total_memory / (1024 ** 3)
@@ -104,7 +104,7 @@ def main():
     num_epochs = 3
     learning_rate = 1e-4
     
-    # Run training in a separate thread to allow asynchronous processing.
+    # Run training in a separate thread to allow asynchronous processing
     train_thread = threading.Thread(target=train_model, args=(model, dataloader, num_epochs, learning_rate, device))
     train_thread.start()
     train_thread.join()
