@@ -30,8 +30,7 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model, dtype=torch.float32)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
-                             (-math.log(10000.0) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)  # (1, max_len, d_model)
@@ -176,9 +175,8 @@ class RAGGenerator(nn.Module):
         context = self.retriever.retrieve(query_str)
         # Create a dummy context tensor (all ones) matching query_ids' shape
         context_tensor = torch.ones_like(query_ids)
-        # Concatenate query and context tensor to form a prompt
         prompt = torch.cat([query_ids, context_tensor], dim=1)
-        # Use the chain-of-thought generator's generation function (which does not require an externally provided memory)
+        # Use the chain-of-thought generator's generation method (generate_with_prompt)
         generated_ids = self.generator.generate_with_prompt(prompt)
         return generated_ids
 
@@ -334,20 +332,23 @@ class VideoEncoder(nn.Module):
 class VideoDecoder(nn.Module):
     def __init__(self, in_dim, num_frames, frame_size):
         super(VideoDecoder, self).__init__()
-        self.fc = nn.Linear(in_dim, 32 * 4 * 4)
-        self.deconv3d = nn.Sequential(
-            nn.ConvTranspose3d(32, 16, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1), output_padding=(0,1,1)),
-            nn.ReLU(),
-            nn.ConvTranspose3d(16, 3, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1), output_padding=(0,1,1)),
-            nn.Tanh()
-        )
         self.num_frames = num_frames
         self.frame_size = frame_size  # (H, W)
+        # Map latent to (B, 32, num_frames, 8, 8)
+        self.fc = nn.Linear(in_dim, 32 * num_frames * 8 * 8)
+        # Three-layer deconvolution to upscale spatial dims from 8 to 64
+        self.deconv3d = nn.Sequential(
+            nn.ConvTranspose3d(32, 32, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(32, 16, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(16, 3, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)),
+            nn.Tanh()
+        )
     def forward(self, z):
         B = z.size(0)
-        x = self.fc(z)
-        x = x.view(B, 32, 1, 4, 4)
-        x = x.repeat(1, 1, self.num_frames, 1, 1)
+        x = self.fc(z)  # (B, 32 * num_frames * 8 * 8)
+        x = x.view(B, 32, self.num_frames, 8, 8)
         return self.deconv3d(x)
 
 #####################################
@@ -457,10 +458,10 @@ class UnifiedMultimodalModel(nn.Module):
         if "video" in inputs:
             branch_features["video"] = self.video_encoder(inputs["video"])
             outputs["video_out"] = self.video_decoder(branch_features["video"])
-        # Core fusion of raw encoder features
+        # Core fusion: fuse raw encoder features
         core_fused = self.core_fusion(branch_features)
         outputs["core_fused"] = core_fused
-        # External fusion of branch outputs
+        # External fusion: fuse branch outputs
         ext_fused = self.external_fusion(branch_features)
         outputs["external_fused"] = ext_fused
         # Apply latent attention on fused external features (unsqueeze to simulate sequence)

@@ -4,7 +4,7 @@ test.py
 
 Interactive test script for the UnifiedMultimodalModel.
 This script loads the trained model (if available) and enters an interactive loop
-where the user can send text messages and also issue special commands to create/execute scripts.
+where the user can send text messages and issue special commands to create/execute scripts.
 Typing "bye" terminates the session.
 """
 
@@ -18,7 +18,7 @@ def tokenize(text, seq_len=32):
     words = text.strip().split()
     tokens = [ord(w[0]) % VOCAB_SIZE for w in words if w]
     if len(tokens) < seq_len:
-        tokens += [0]*(seq_len - len(tokens))
+        tokens += [0] * (seq_len - len(tokens))
     else:
         tokens = tokens[:seq_len]
     return torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
@@ -36,6 +36,7 @@ def load_model(config, model_path="unified_model.pt"):
         print(f"Loaded trained model weights from {model_path}.")
     except Exception as e:
         print(f"Failed to load weights from {model_path}. Using random initialized model. ({e})")
+    model.to(device)
     model.eval()
     return model
 
@@ -50,7 +51,6 @@ def interactive_loop(model, config):
         if user_input.lower() == "bye":
             print("Shutting down. Goodbye!")
             break
-        # Check for special commands
         if user_input.startswith("build_script:"):
             script_name = user_input.split("build_script:", 1)[1].strip()
             result = model.call_function("build_script", script_name)
@@ -61,11 +61,10 @@ def interactive_loop(model, config):
             result = model.call_function("execute_script", script_name)
             print("Model:", result)
             continue
-        # Otherwise, process as normal text query
         text_tensor = tokenize(user_input, seq_len=seq_len).to(model.device)
         dummy_audio = torch.zeros(1, config["audio_output_length"]).to(model.device)
         dummy_image = torch.zeros(1, 3, config.get("image_size", (3,64,64))[1], config.get("image_size", (3,64,64))[2]).to(model.device)
-        dummy_video = torch.zeros(1, 3, config.get("video_num_frames",16), config.get("video_frame_size", (64,64))[0], config.get("video_frame_size", (64,64))[1]).to(model.device)
+        dummy_video = torch.zeros(1, 3, config.get("video_num_frames", 16), config.get("video_frame_size", (64,64))[0], config.get("video_frame_size", (64,64))[1]).to(model.device)
         inputs = {
             "text": text_tensor,
             "query": text_tensor,
