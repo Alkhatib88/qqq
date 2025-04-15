@@ -2,121 +2,87 @@
 """
 test.py
 
-Interactive Chat Loop for TitanModel
-
-This script loads the TitanModel (from model.py) and the vocabulary (from vocab.json),
-then enters a chat loop. The user can type a query and receive a chain-of-thought AI-generated
-response. The conversation continues until the user types "exit", "quit", or "goodbye".
-
-The script loads the model fully on the GPU and sets a per-process memory fraction so that
-90% of the GPU memory is available for the model/inference, leaving 10% in reserve for peak usage.
-
-Suitable for deployment on RunPod H200, with GPU acceleration enabled.
+Interactive test script for the UnifiedMultimodalModel.
+This script loads the trained model (if available) and enters an interactive loop
+where the user can send text messages and also issue special commands to create/execute scripts.
+Typing "bye" terminates the session.
 """
 
 import torch
-import json
-import os
-from model import TitanModel
+from model import UnifiedMultimodalModel, get_default_config
+import sys
 
-# Define VOCAB_SIZE as used during training.
-VOCAB_SIZE = 5000
+VOCAB_SIZE = 10000
 
-def load_vocab(vocab_path="vocab.json"):
-    """Load vocabulary from a JSON file."""
-    with open(vocab_path, "r") as f:
-        vocab = json.load(f)
-    return vocab
+def tokenize(text, seq_len=32):
+    words = text.strip().split()
+    tokens = [ord(w[0]) % VOCAB_SIZE for w in words if w]
+    if len(tokens) < seq_len:
+        tokens += [0]*(seq_len - len(tokens))
+    else:
+        tokens = tokens[:seq_len]
+    return torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
 
-def tokenize_text(text, vocab, max_length=128):
-    """Simple whitespace tokenizer to convert text into token IDs."""
-    tokens = text.split()
-    token_ids = [vocab.get(token, vocab.get("<unk>", 1)) for token in tokens][:max_length]
-    if len(token_ids) < max_length:
-        token_ids += [vocab.get("<pad>", 0)] * (max_length - len(token_ids))
-    return token_ids
+def detokenize(token_tensor):
+    token_list = token_tensor.squeeze(0).tolist()
+    return "".join([chr((int(t) % 26) + 97) for t in token_list])
 
-def decode_tokens(token_ids, rev_vocab):
-    """Convert token IDs back into a readable string."""
-    tokens = [rev_vocab.get(str(tok), "<unk>") for tok in token_ids if tok != 0]
-    return " ".join(tokens)
-
-def main():
-    # Ensure the vocabulary file exists
-    if not os.path.exists("vocab.json"):
-        print("No vocab.json found; please run train.py first to generate the vocabulary.")
-        return
-
-    # Load vocabulary and build a reverse lookup dictionary
-    vocab = load_vocab("vocab.json")
-    rev_vocab = {str(idx): word for word, idx in vocab.items()}
-    print("Vocabulary loaded from vocab.json.")
-
-    # Define the model configuration (must match training settings)
-    config = {
-        "text_vocab_size": VOCAB_SIZE,
-        "text_embed_dim": 512,
-        "text_encoder_layers": 2,
-        "text_decoder_layers": 2,
-        "text_num_heads": 8,
-        "text_ff_dim": 1024,
-        "text_max_len": 128,
-        "image_latent_dim": 256,
-        "audio_latent_dim": 256,
-        "audio_output_length": 16000,
-        "video_latent_dim": 256,
-        "video_output_shape": (3, 16, 64, 64),
-        "fused_dim": 512,
-        "attention_num_heads": 8,
-        "attention_latent_dim": 64,
-        "cot_decoder_layers": 2,
-        "cot_max_len": 256,
-        "rag_documents": [
-            "Doc1: Multimodal dataset sample.",
-            "Doc2: Python code reasoning examples.",
-            "Doc3: Advanced topics in computer vision and language."
-        ]
-    }
-
-    # Use GPU if available, else CPU
+def load_model(config, model_path="unified_model.pt"):
+    model = UnifiedMultimodalModel(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # If using GPU, set the per-process memory fraction to reserve headroom (e.g., 10% reserved)
-    if device.type == "cuda":
-        device_index = torch.cuda.current_device()  # Get the current GPU index (e.g., 0)
-        torch.cuda.set_per_process_memory_fraction(0.9, device=device_index)
-        torch.cuda.empty_cache()
-        print("GPU memory limited to 90% of total (10% reserved for peak usage).")
-
-    # Load the TitanModel fully onto the GPU
-    model = TitanModel(config).to(device)
+    try:
+        state = torch.load(model_path, map_location=device)
+        model.load_state_dict(state)
+        print(f"Loaded trained model weights from {model_path}.")
+    except Exception as e:
+        print(f"Failed to load weights from {model_path}. Using random initialized model. ({e})")
     model.eval()
+    return model
 
-    print("\nWelcome to TitanModel Interactive Chat!")
-    print("Type your query and press Enter (type 'exit', 'quit', or 'goodbye' to end the chat).\n")
-
-    # Main chat loop
+def interactive_loop(model, config):
+    seq_len = config.get("text_seq_len", 32)
+    print("Interactive mode. Type your message. Use commands:\n" +
+          "  'build_script: <script_name>'\n" +
+          "  'execute_script: <script_name>'\n" +
+          "Type 'bye' to exit.")
     while True:
         user_input = input("You: ").strip()
-        # End chat if user types any goodbye keyword
-        if user_input.lower() in ["exit", "quit", "goodbye"]:
-            print("Exiting chat. Goodbye!")
+        if user_input.lower() == "bye":
+            print("Shutting down. Goodbye!")
             break
-
-        # Tokenize the input text
-        token_ids = tokenize_text(user_input, vocab, max_length=50)
-        # Convert to tensor (with non_blocking to speed up GPU transfers) and add batch dimension
-        text_tokens = torch.tensor([token_ids], dtype=torch.long).to(device, non_blocking=True)
-
-        # Generate response using the chain-of-thought generator in the model
+        # Check for special commands
+        if user_input.startswith("build_script:"):
+            script_name = user_input.split("build_script:", 1)[1].strip()
+            result = model.call_function("build_script", script_name)
+            print("Model:", result)
+            continue
+        if user_input.startswith("execute_script:"):
+            script_name = user_input.split("execute_script:", 1)[1].strip()
+            result = model.call_function("execute_script", script_name)
+            print("Model:", result)
+            continue
+        # Otherwise, process as normal text query
+        text_tensor = tokenize(user_input, seq_len=seq_len).to(model.device)
+        dummy_audio = torch.zeros(1, config["audio_output_length"]).to(model.device)
+        dummy_image = torch.zeros(1, 3, config.get("image_size", (3,64,64))[1], config.get("image_size", (3,64,64))[2]).to(model.device)
+        dummy_video = torch.zeros(1, 3, config.get("video_num_frames",16), config.get("video_frame_size", (64,64))[0], config.get("video_frame_size", (64,64))[1]).to(model.device)
+        inputs = {
+            "text": text_tensor,
+            "query": text_tensor,
+            "audio": dummy_audio,
+            "image": dummy_image,
+            "video": dummy_video
+        }
         with torch.no_grad():
-            generated_ids = model.cot_generator.generate_with_prompt(text_tokens)
-        generated_ids = generated_ids[0].cpu().tolist()
-        response = decode_tokens(generated_ids, rev_vocab)
+            outputs = model(inputs)
+            response_ids = outputs.get("cot_out", text_tensor)
+        response = detokenize(response_ids[0].cpu())
+        print("Model:", response)
 
-        print("TitanModel:", response)
-        print()
+def main():
+    config = get_default_config()
+    model = load_model(config)
+    interactive_loop(model, config)
 
 if __name__ == "__main__":
     main()
