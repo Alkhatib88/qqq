@@ -3,6 +3,7 @@
 test.py
 
 Interactive test script for the UnifiedMultimodalModel.
+
 This script loads the trained model (if available) and enters an interactive loop
 where the user can send text messages and issue special commands to create/execute scripts.
 Typing "bye" terminates the session.
@@ -25,6 +26,7 @@ def tokenize(text, seq_len=32):
 
 def detokenize(token_tensor):
     token_list = token_tensor.squeeze(0).tolist()
+    # Convert each token to a letter for demonstration purposes
     return "".join([chr((int(t) % 26) + 97) for t in token_list])
 
 def load_model(config, model_path="unified_model.pt"):
@@ -35,7 +37,7 @@ def load_model(config, model_path="unified_model.pt"):
         model.load_state_dict(state)
         print(f"Loaded trained model weights from {model_path}.")
     except Exception as e:
-        print(f"Failed to load weights from {model_path}. Using random initialized model. ({e})")
+        print(f"Failed to load weights from {model_path}. Using randomly initialized model. ({e})")
     model.to(device)
     model.eval()
     return model
@@ -63,8 +65,11 @@ def interactive_loop(model, config):
             continue
         text_tensor = tokenize(user_input, seq_len=seq_len).to(model.device)
         dummy_audio = torch.zeros(1, config["audio_output_length"]).to(model.device)
-        dummy_image = torch.zeros(1, 3, config.get("image_size", (3,64,64))[1], config.get("image_size", (3,64,64))[2]).to(model.device)
-        dummy_video = torch.zeros(1, 3, config.get("video_num_frames", 16), config.get("video_frame_size", (64,64))[0], config.get("video_frame_size", (64,64))[1]).to(model.device)
+        dummy_image = torch.zeros(1, 3, config.get("image_size", (3, 64, 64))[1],
+                                    config.get("image_size", (3, 64, 64))[2]).to(model.device)
+        dummy_video = torch.zeros(1, 3, config.get("video_num_frames", 16),
+                                    config.get("video_frame_size", (64, 64))[0],
+                                    config.get("video_frame_size", (64, 64))[1]).to(model.device)
         inputs = {
             "text": text_tensor,
             "query": text_tensor,

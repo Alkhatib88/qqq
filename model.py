@@ -30,7 +30,8 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model, dtype=torch.float32)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
+                             (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)  # (1, max_len, d_model)
@@ -176,7 +177,6 @@ class RAGGenerator(nn.Module):
         # Create a dummy context tensor (all ones) matching query_ids' shape
         context_tensor = torch.ones_like(query_ids)
         prompt = torch.cat([query_ids, context_tensor], dim=1)
-        # Use the chain-of-thought generator's generation method (generate_with_prompt)
         generated_ids = self.generator.generate_with_prompt(prompt)
         return generated_ids
 
@@ -286,7 +286,7 @@ class AudioEncoder(nn.Module):
             nn.Conv1d(16, 32, 15, stride=4, padding=7),
             nn.ReLU()
         )
-        # Updated to use 32*1000 instead of 32*250 for matching diffusion output projection
+        # Updated to use 32*1000
         self.fc = nn.Linear(32 * 1000, out_dim)
     def forward(self, x):
         B = x.size(0)
@@ -334,9 +334,7 @@ class VideoDecoder(nn.Module):
         super(VideoDecoder, self).__init__()
         self.num_frames = num_frames
         self.frame_size = frame_size  # (H, W)
-        # Map latent to (B, 32, num_frames, 8, 8)
         self.fc = nn.Linear(in_dim, 32 * num_frames * 8 * 8)
-        # Three-layer deconvolution to upscale spatial dims from 8 to 64
         self.deconv3d = nn.Sequential(
             nn.ConvTranspose3d(32, 32, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)),
             nn.ReLU(),
@@ -347,7 +345,7 @@ class VideoDecoder(nn.Module):
         )
     def forward(self, z):
         B = z.size(0)
-        x = self.fc(z)  # (B, 32 * num_frames * 8 * 8)
+        x = self.fc(z)  # (B, 32*num_frames*8*8)
         x = x.view(B, 32, self.num_frames, 8, 8)
         return self.deconv3d(x)
 
@@ -479,16 +477,19 @@ class UnifiedMultimodalModel(nn.Module):
 #####################################
 # Dummy Dataset for Training and Testing
 #####################################
+import random
 class DummyDataset(torch.utils.data.Dataset):
     def __init__(self, num_samples, config):
         self.num_samples = num_samples
         self.vocab_size = config["text_vocab_size"]
         self.seq_len = config.get("text_seq_len", 32)
-        self.image_size = config.get("image_size", (3,64,64))
+        self.image_size = config.get("image_size", (3, 64, 64))
         self.audio_length = config.get("audio_output_length", 16000)
         self.video_shape = (3, config.get("video_num_frames", 16), 
-                            config.get("video_frame_size", (64,64))[0], 
-                            config.get("video_frame_size", (64,64))[1])
+                            config.get("video_frame_size", (64, 64))[0], 
+                            config.get("video_frame_size", (64, 64))[1])
+        # Get list of training dataset names from config for simulation purposes
+        self.sources = config.get("training_datasets", [])
     def __len__(self):
         return self.num_samples
     def __getitem__(self, idx):
@@ -498,13 +499,14 @@ class DummyDataset(torch.utils.data.Dataset):
         sample["image"] = torch.randn(*self.image_size)
         sample["video"] = torch.randn(*self.video_shape)
         sample["query"] = torch.randint(0, self.vocab_size, (self.seq_len,))
+        # Add a 'source' field randomly chosen from the training dataset list
+        sample["source"] = random.choice(self.sources) if self.sources else "dummy_source"
         return sample
 
 #####################################
 # Default Configuration Function
 #####################################
 def get_default_config():
-    # Training dataset list (covers coding, game engines, 3D tools, reasoning, history, news, etc.)
     training_datasets = [
         "Multimodal-Fatima/VQAv2_sample_train",
         "Multimodal-Fatima/OxfordFlowers_test",
@@ -548,7 +550,6 @@ def get_default_config():
         "fhai50032/GPQA-Thinking-O1",
         "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
         "Salesforce/xlam-function-calling-60k",
-        # Additional sources for game engines, 3D tools, and general knowledge:
         "unrealengine/UnrealEngineDocumentation",
         "epicgames/UE5_Blueprint",
         "voxelplugin/UE_Voxel_Plugin_Samples",
