@@ -250,7 +250,7 @@ class ImageEncoder(nn.Module):
             nn.Conv2d(64, 128, 4, stride=2, padding=1),
             nn.ReLU()
         )
-        self.fc = nn.Linear(128*8*8, out_dim)
+        self.fc = nn.Linear(128 * 8 * 8, out_dim)
     def forward(self, x):
         B = x.size(0)
         feat = self.conv(x)
@@ -260,7 +260,7 @@ class ImageEncoder(nn.Module):
 class ImageDecoder(nn.Module):
     def __init__(self, in_dim):
         super(ImageDecoder, self).__init__()
-        self.fc = nn.Linear(in_dim, 128*8*8)
+        self.fc = nn.Linear(in_dim, 128 * 8 * 8)
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.ReLU(),
@@ -285,7 +285,8 @@ class AudioEncoder(nn.Module):
             nn.Conv1d(16, 32, 15, stride=4, padding=7),
             nn.ReLU()
         )
-        self.fc = nn.Linear(32*250, out_dim)
+        # Note: upgrade to use 32*1000 instead of 32*250 for better matching 
+        self.fc = nn.Linear(32 * 1000, out_dim)
     def forward(self, x):
         B = x.size(0)
         feat = self.conv(x)
@@ -295,7 +296,7 @@ class AudioEncoder(nn.Module):
 class AudioDecoder(nn.Module):
     def __init__(self, in_dim, output_length):
         super(AudioDecoder, self).__init__()
-        self.fc = nn.Linear(in_dim, 32*250)
+        self.fc = nn.Linear(in_dim, 32 * 1000)
         self.deconv = nn.Sequential(
             nn.ConvTranspose1d(32, 16, 15, stride=4, padding=7, output_padding=3),
             nn.ReLU(),
@@ -306,7 +307,7 @@ class AudioDecoder(nn.Module):
     def forward(self, z):
         B = z.size(0)
         x = self.fc(z)
-        x = x.view(B, 32, 250)
+        x = x.view(B, 32, 1000)
         return self.deconv(x)
 
 # Video Encoder and Decoder (using 3D CNN)
@@ -320,7 +321,7 @@ class VideoEncoder(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool3d((1,4,4))
         )
-        self.fc = nn.Linear(32*4*4, out_dim)
+        self.fc = nn.Linear(32 * 4 * 4, out_dim)
     def forward(self, x):
         B = x.size(0)
         feat = self.conv3d(x)
@@ -330,7 +331,7 @@ class VideoEncoder(nn.Module):
 class VideoDecoder(nn.Module):
     def __init__(self, in_dim, num_frames, frame_size):
         super(VideoDecoder, self).__init__()
-        self.fc = nn.Linear(in_dim, 32*4*4)
+        self.fc = nn.Linear(in_dim, 32 * 4 * 4)
         self.deconv3d = nn.Sequential(
             nn.ConvTranspose3d(32, 16, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1), output_padding=(0,1,1)),
             nn.ReLU(),
@@ -338,7 +339,7 @@ class VideoDecoder(nn.Module):
             nn.Tanh()
         )
         self.num_frames = num_frames
-        self.frame_size = frame_size
+        self.frame_size = frame_size  # (H, W)
     def forward(self, z):
         B = z.size(0)
         x = self.fc(z)
@@ -420,7 +421,7 @@ class UnifiedMultimodalModel(nn.Module):
         self.cot_generator = ChainOfThoughtGenerator(config['text_vocab_size'], config['text_embed_dim'],
                                                      config['cot_decoder_layers'], config['text_num_heads'],
                                                      config['text_ff_dim'], max_len=config.get('cot_max_len',256))
-        # Advanced RAG
+        # Advanced Retrieval-Augmented Generation (RAG)
         self.retriever = Retriever(config.get('rag_documents', ["Default document content."]))
         self.rag_generator = RAGGenerator(self.cot_generator, self.retriever)
         # Function caller with default tools
@@ -429,36 +430,36 @@ class UnifiedMultimodalModel(nn.Module):
     def forward(self, inputs):
         outputs = {}
         branch_features = {}
-        # Text branch
+        # Process text branch
         if 'text' in inputs:
             text_enc = self.text_encoder(inputs['text'])
             branch_features['text'] = text_enc[:, 0, :]
             memory_text = text_enc.mean(dim=1, keepdim=True)
             outputs['text_out'] = self.text_decoder(inputs['text'], memory_text)
-        # Audio branch
+        # Process audio branch
         if 'audio' in inputs:
             branch_features['audio'] = self.audio_encoder(inputs['audio'])
             outputs['audio_out'] = self.audio_decoder(branch_features['audio'])
-        # Image branch
+        # Process image branch
         if 'image' in inputs:
             img_feat = self.image_encoder(inputs['image'])
             diffused = self.diffusion_module(inputs['image'])
             branch_features['image'] = (img_feat + torch.flatten(diffused, 1)) / 2
             outputs['image_out'] = self.image_decoder(branch_features['image'])
-        # Video branch
+        # Process video branch
         if 'video' in inputs:
             branch_features['video'] = self.video_encoder(inputs['video'])
             outputs['video_out'] = self.video_decoder(branch_features['video'])
-        # Core fusion of raw features
+        # Core fusion of raw encoder features
         core_fused = self.core_fusion(branch_features)
         outputs['core_fused'] = core_fused
         # External fusion of branch outputs
         ext_fused = self.external_fusion(branch_features)
         outputs['external_fused'] = ext_fused
-        # Latent attention over fused external features
+        # Apply latent attention on external fused features (unsqueeze to simulate sequence)
         attended = self.latent_attention(ext_fused.unsqueeze(1))
         outputs['attended_fused'] = attended
-        # RAG and Chain-of-Thought if query is provided
+        # RAG and Chain-of-Thought if query provided
         if 'query' in inputs:
             outputs['rag_out'] = self.rag_generator(inputs['query'])
             outputs['cot_out'] = self.cot_generator.generate_with_prompt(inputs['query'])
@@ -539,7 +540,6 @@ def get_default_config():
         "fhai50032/GPQA-Thinking-O1",
         "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
         "Salesforce/xlam-function-calling-60k",
-        # Additional sources covering Unreal Engine, voxel plugins, Blender, and news/history:
         "unrealengine/UnrealEngineDocumentation",
         "epicgames/UE5_Blueprint",
         "voxelplugin/UE_Voxel_Plugin_Samples",
