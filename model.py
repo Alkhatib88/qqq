@@ -174,10 +174,13 @@ class RAGGenerator(nn.Module):
     def forward(self, query_ids):
         query_str = " ".join(map(str, query_ids[0].tolist()))
         context = self.retriever.retrieve(query_str)
+        # Create a dummy context tensor (all ones) matching query_ids' shape
         context_tensor = torch.ones_like(query_ids)
+        # Concatenate query and context tensor to form a prompt
         prompt = torch.cat([query_ids, context_tensor], dim=1)
-        logits = self.generator(prompt)
-        return torch.argmax(logits, dim=-1)
+        # Use the chain-of-thought generator's generation function (which does not require an externally provided memory)
+        generated_ids = self.generator.generate_with_prompt(prompt)
+        return generated_ids
 
 #####################################
 # Diffusion Module & Residual Block (for image refinement)
@@ -454,16 +457,16 @@ class UnifiedMultimodalModel(nn.Module):
         if "video" in inputs:
             branch_features["video"] = self.video_encoder(inputs["video"])
             outputs["video_out"] = self.video_decoder(branch_features["video"])
-        # Core fusion: fuse raw encoder features
+        # Core fusion of raw encoder features
         core_fused = self.core_fusion(branch_features)
         outputs["core_fused"] = core_fused
-        # External fusion: fuse branch outputs
+        # External fusion of branch outputs
         ext_fused = self.external_fusion(branch_features)
         outputs["external_fused"] = ext_fused
         # Apply latent attention on fused external features (unsqueeze to simulate sequence)
         attended = self.latent_attention(ext_fused.unsqueeze(1))
         outputs["attended_fused"] = attended
-        # Advanced retrieval-augmented generation and chain-of-thought if query provided
+        # Advanced RAG and chain-of-thought generation if a query is provided
         if "query" in inputs:
             outputs["rag_out"] = self.rag_generator(inputs["query"])
             outputs["cot_out"] = self.cot_generator.generate_with_prompt(inputs["query"])
