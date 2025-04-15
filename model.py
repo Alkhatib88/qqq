@@ -285,7 +285,7 @@ class AudioEncoder(nn.Module):
             nn.Conv1d(16, 32, 15, stride=4, padding=7),
             nn.ReLU()
         )
-        # Note: upgrade to use 32*1000 instead of 32*250 for better matching 
+        # Updated to use 32*1000 instead of 32*250 for matching diffusion output projection
         self.fc = nn.Linear(32 * 1000, out_dim)
     def forward(self, x):
         B = x.size(0)
@@ -404,6 +404,8 @@ class UnifiedMultimodalModel(nn.Module):
         self.video_decoder = VideoDecoder(config['video_latent_dim'], config['video_num_frames'], config['video_frame_size'])
         # Diffusion module for image refinement
         self.diffusion_module = DiffusionModule(in_channels=3, model_channels=64, out_channels=3, num_res_blocks=2)
+        # Projection layer to map flattened diffusion output to image latent space
+        self.diffusion_proj = nn.Linear(3 * 64 * 64, config['image_latent_dim'])
         # Core Fusion: fuse raw encoder features
         input_dims = {
             "text": config['text_embed_dim'],
@@ -415,7 +417,7 @@ class UnifiedMultimodalModel(nn.Module):
         # External Fusion: fuse branch outputs
         branch_dims = input_dims
         self.external_fusion = ExternalFusion(branch_dims, config['external_fused_dim'])
-        # Multi-Head Latent Attention over external fused features
+        # Multi-Head Latent Attention over fused external features
         self.latent_attention = MultiHeadLatentAttention(config['external_fused_dim'], config['attention_num_heads'], config['attention_latent_dim'])
         # Chain-of-Thought Generator for reasoning
         self.cot_generator = ChainOfThoughtGenerator(config['text_vocab_size'], config['text_embed_dim'],
@@ -431,38 +433,40 @@ class UnifiedMultimodalModel(nn.Module):
         outputs = {}
         branch_features = {}
         # Process text branch
-        if 'text' in inputs:
-            text_enc = self.text_encoder(inputs['text'])
-            branch_features['text'] = text_enc[:, 0, :]
+        if "text" in inputs:
+            text_enc = self.text_encoder(inputs["text"])
+            branch_features["text"] = text_enc[:, 0, :]
             memory_text = text_enc.mean(dim=1, keepdim=True)
-            outputs['text_out'] = self.text_decoder(inputs['text'], memory_text)
+            outputs["text_out"] = self.text_decoder(inputs["text"], memory_text)
         # Process audio branch
-        if 'audio' in inputs:
-            branch_features['audio'] = self.audio_encoder(inputs['audio'])
-            outputs['audio_out'] = self.audio_decoder(branch_features['audio'])
+        if "audio" in inputs:
+            branch_features["audio"] = self.audio_encoder(inputs["audio"])
+            outputs["audio_out"] = self.audio_decoder(branch_features["audio"])
         # Process image branch
-        if 'image' in inputs:
-            img_feat = self.image_encoder(inputs['image'])
-            diffused = self.diffusion_module(inputs['image'])
-            branch_features['image'] = (img_feat + torch.flatten(diffused, 1)) / 2
-            outputs['image_out'] = self.image_decoder(branch_features['image'])
+        if "image" in inputs:
+            img_feat = self.image_encoder(inputs["image"])
+            diffused = self.diffusion_module(inputs["image"])
+            diffused_flat = torch.flatten(diffused, 1)
+            diffused_proj = self.diffusion_proj(diffused_flat)
+            branch_features["image"] = (img_feat + diffused_proj) / 2
+            outputs["image_out"] = self.image_decoder(branch_features["image"])
         # Process video branch
-        if 'video' in inputs:
-            branch_features['video'] = self.video_encoder(inputs['video'])
-            outputs['video_out'] = self.video_decoder(branch_features['video'])
-        # Core fusion of raw encoder features
+        if "video" in inputs:
+            branch_features["video"] = self.video_encoder(inputs["video"])
+            outputs["video_out"] = self.video_decoder(branch_features["video"])
+        # Core fusion: fuse raw encoder features
         core_fused = self.core_fusion(branch_features)
-        outputs['core_fused'] = core_fused
-        # External fusion of branch outputs
+        outputs["core_fused"] = core_fused
+        # External fusion: fuse branch outputs
         ext_fused = self.external_fusion(branch_features)
-        outputs['external_fused'] = ext_fused
-        # Apply latent attention on external fused features (unsqueeze to simulate sequence)
+        outputs["external_fused"] = ext_fused
+        # Apply latent attention on fused external features (unsqueeze to simulate sequence)
         attended = self.latent_attention(ext_fused.unsqueeze(1))
-        outputs['attended_fused'] = attended
-        # RAG and Chain-of-Thought if query provided
-        if 'query' in inputs:
-            outputs['rag_out'] = self.rag_generator(inputs['query'])
-            outputs['cot_out'] = self.cot_generator.generate_with_prompt(inputs['query'])
+        outputs["attended_fused"] = attended
+        # Advanced retrieval-augmented generation and chain-of-thought if query provided
+        if "query" in inputs:
+            outputs["rag_out"] = self.rag_generator(inputs["query"])
+            outputs["cot_out"] = self.cot_generator.generate_with_prompt(inputs["query"])
         return outputs
 
     def call_function(self, func_name, *args, **kwargs):
@@ -474,29 +478,29 @@ class UnifiedMultimodalModel(nn.Module):
 class DummyDataset(torch.utils.data.Dataset):
     def __init__(self, num_samples, config):
         self.num_samples = num_samples
-        self.vocab_size = config['text_vocab_size']
-        self.seq_len = config.get('text_seq_len', 32)
-        self.image_size = config.get('image_size', (3,64,64))
-        self.audio_length = config.get('audio_output_length', 16000)
-        self.video_shape = (3, config.get('video_num_frames', 16), 
-                            config.get('video_frame_size', (64,64))[0], 
-                            config.get('video_frame_size', (64,64))[1])
+        self.vocab_size = config["text_vocab_size"]
+        self.seq_len = config.get("text_seq_len", 32)
+        self.image_size = config.get("image_size", (3,64,64))
+        self.audio_length = config.get("audio_output_length", 16000)
+        self.video_shape = (3, config.get("video_num_frames", 16), 
+                            config.get("video_frame_size", (64,64))[0], 
+                            config.get("video_frame_size", (64,64))[1])
     def __len__(self):
         return self.num_samples
     def __getitem__(self, idx):
         sample = {}
-        sample['text'] = torch.randint(0, self.vocab_size, (self.seq_len,))
-        sample['audio'] = torch.randn(1, self.audio_length)
-        sample['image'] = torch.randn(*self.image_size)
-        sample['video'] = torch.randn(*self.video_shape)
-        sample['query'] = torch.randint(0, self.vocab_size, (self.seq_len,))
+        sample["text"] = torch.randint(0, self.vocab_size, (self.seq_len,))
+        sample["audio"] = torch.randn(1, self.audio_length)
+        sample["image"] = torch.randn(*self.image_size)
+        sample["video"] = torch.randn(*self.video_shape)
+        sample["query"] = torch.randint(0, self.vocab_size, (self.seq_len,))
         return sample
 
 #####################################
 # Default Configuration Function
 #####################################
 def get_default_config():
-    # Training dataset list (a mixture of coding, engine, multimodal, reasoning, history, news, etc.)
+    # Training dataset list (covers coding, game engines, 3D tools, reasoning, history, news, etc.)
     training_datasets = [
         "Multimodal-Fatima/VQAv2_sample_train",
         "Multimodal-Fatima/OxfordFlowers_test",
@@ -540,6 +544,7 @@ def get_default_config():
         "fhai50032/GPQA-Thinking-O1",
         "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
         "Salesforce/xlam-function-calling-60k",
+        # Additional sources for game engines, 3D tools, and general knowledge:
         "unrealengine/UnrealEngineDocumentation",
         "epicgames/UE5_Blueprint",
         "voxelplugin/UE_Voxel_Plugin_Samples",
