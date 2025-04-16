@@ -7,13 +7,13 @@ Training script for the UnifiedMultimodalModel.
 - Builds a custom tokenizer (from tokenizer.py) using sample texts.
 - Loads and preprocesses the data via a unified MultiModalDataset.
 - Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC with gating, advanced chain-of-thought generation,
-  custom multi-head latent attention, Deepseeks Reasoning) until target performance is reached.
-- Displays extensive information on datasets, model configuration (parameters, memory, subject knowledge),
-  and training status.
+  custom multi-head latent attention, Deepseeks Reasoning, etc.) until a target performance is reached.
+- Displays extensive information on model configuration, dataset status, model parameters, and training progress.
 - Configures GPU to use 95% of its memory.
 """
 
 import os
+import time
 import threading
 import random
 import json
@@ -22,7 +22,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from torchvision import transforms
 
 from model import UnifiedMultimodalModel
@@ -127,41 +127,45 @@ training_datasets = [
 ]
 
 #####################################
-# get_default_config() Updated (Note: image_size as a 2-tuple)
+# Helper Function: Try Loading a Dataset with Retries
 #####################################
-def get_default_config():
-    return {
-        "text_vocab_size": 10000,
-        "text_embed_dim": 512,
-        "text_encoder_layers": 2,
-        "text_decoder_layers": 2,
-        "text_num_heads": 8,
-        "text_ff_dim": 1024,
-        "text_max_len": 128,
-        "text_seq_len": 32,
-        "audio_latent_dim": 256,
-        "audio_output_length": 16000,
-        "image_latent_dim": 256,
-        "video_latent_dim": 256,
-        "video_num_frames": 16,
-        "video_frame_size": (64, 64),
-        "core_fused_dim": 512,
-        "external_fused_dim": 512,
-        "attention_num_heads": 8,
-        "attention_latent_dim": 128,
-        "cot_decoder_layers": 2,
-        "cot_max_len": 128,
-        "rag_documents": [
-            "Document 1: Advanced multimodal techniques.",
-            "Document 2: Chain-of-thought reasoning improves performance.",
-            "Document 3: Retrieval augmented generation in AI."
-        ],
-        "image_size": (224, 224),   # Changed to a valid 2-tuple for Resize
-        "training_datasets": training_datasets
-    }
+def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
+    use_token = os.environ.get("HF_AUTH_TOKEN", None)
+    delay = init_delay
+    for attempt in range(max_retries):
+        try:
+            ds = load_dataset(name, split=split, use_auth_token=use_token)
+            return ds
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str:
+                print(f"Rate limited on dataset {name} (split={split}), attempt {attempt+1}/{max_retries}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay *= 2
+            elif "Config name is missing" in err_str:
+                try:
+                    builder = load_dataset_builder(name, use_auth_token=use_token)
+                    config_name = builder.info.config_names[0]
+                    print(f"Automatically selecting config '{config_name}' for dataset {name} (split={split}).")
+                    ds = load_dataset(name, config_name, split=split, use_auth_token=use_token)
+                    return ds
+                except Exception as e_config:
+                    print(f"Failed to load dataset {name} with a config: {e_config}")
+            else:
+                print(f"Error loading dataset {name} (split={split}): {e}")
+        # Try next attempt
+    # If failed with train, try test split as a fallback
+    if split == 'train':
+        try:
+            ds = load_dataset(name, split='test', use_auth_token=use_token)
+            return ds
+        except Exception as e_test:
+            print(f"Failed to load dataset {name} with split 'test': {e_test}")
+    # If still failing, raise the error to signal dataset load failure.
+    raise Exception(f"Failed to load dataset {name} after {max_retries} attempts.")
 
 #####################################
-# MultiModalDataset Implementation with Dummy Fallback
+# MultiModalDataset Implementation (No Dummy Fallback)
 #####################################
 class MultiModalDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_names, tokenizer, image_size=(224, 224)):
@@ -177,24 +181,17 @@ class MultiModalDataset(torch.utils.data.Dataset):
         for name in dataset_names:
             print(f"Downloading dataset: {name}")
             try:
-                ds = load_dataset(name, split='train')
-            except Exception as e_train:
-                print(f"Failed to load 'train' split for {name}: {e_train}")
-                try:
-                    ds = load_dataset(name, split='test')
-                    print(f"Loaded 'test' split for {name}.")
-                except Exception as e_test:
-                    print(f"Both 'train' and 'test' splits failed for {name}: {e_test}")
-                    # Instead of skipping, create a dummy dataset with one sample.
-                    ds = [{"text": "dummy", "image": None, "audio": None, "video": None}]
-                    print(f"Inserting dummy dataset for {name}.")
-            self.datasets.append(ds)
-            self.dataset_names.append(name)
-            total_length += len(ds)
-            self.cumulative_lengths.append(total_length)
+                ds = try_load_dataset(name, split='train')
+                self.datasets.append(ds)
+                self.dataset_names.append(name)
+                length = len(ds) if hasattr(ds, "__len__") else 0
+                total_length += length
+                self.cumulative_lengths.append(total_length)
+            except Exception as e:
+                print(f"Error: Skipping dataset {name} due to error: {e}")
         self.total_length = total_length
-        # Save dataset info for logging
-        dataset_info = {name: {"length": len(ds)} for name, ds in zip(self.dataset_names, self.datasets)}
+        dataset_info = {name: {"length": len(ds) if hasattr(ds, "__len__") else 0} 
+                        for name, ds in zip(self.dataset_names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
             json.dump(dataset_info, f, indent=2)
 
@@ -206,7 +203,11 @@ class MultiModalDataset(torch.utils.data.Dataset):
             if index < cum_len:
                 prev = self.cumulative_lengths[ds_idx-1] if ds_idx > 0 else 0
                 sample_index = index - prev
-                example = self.datasets[ds_idx][sample_index]
+                try:
+                    example = self.datasets[ds_idx][sample_index]
+                except Exception:
+                    # Should not occur since we skip failed datasets
+                    example = {"text": ""}
                 break
         item = {}
         input_text = None
@@ -301,7 +302,7 @@ def multimodal_collate(batch):
     return collated
 
 #####################################
-# Advanced Training Loop with Detailed Reporting and SelfTeach Loss
+# Advanced Training Loop with Detailed Reporting
 #####################################
 def train_model(model, dataloader, dataset_names, target_score, learning_rate, device):
     optimizer = Adam(model.parameters(), lr=learning_rate)
@@ -311,16 +312,18 @@ def train_model(model, dataloader, dataset_names, target_score, learning_rate, d
     overall_score = 0.0
     dataset_scores = {name: 0.0 for name in dataset_names}
     epoch = 0
-    # Log model configuration and parameter stats
+
+    # Log model configuration and parameters
     print("====== Model and Training Configuration ======")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model Parameters: {total_params:,} parameters")
     knowledge_size = total_params / 1e6
     print(f"Estimated Knowledge Size: {knowledge_size:.2f}M parameters")
-    print("Training Datasets:")
+    print("Training Datasets Loaded:")
     for name in dataset_names:
         print(f" - {name}")
     print("================================================")
+
     while overall_score < target_score:
         epoch += 1
         epoch_loss = 0.0
@@ -374,13 +377,13 @@ def main():
     global tokenizer
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
     sample_texts = []
-    # Build vocabulary from available datasets (try 'train', fallback to 'test')
+    # Build vocabulary from available datasets
     for name in training_datasets:
         try:
-            ds_stream = load_dataset(name, split='train', streaming=True)
+            ds_stream = load_dataset(name, split='train', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
         except Exception as e1:
             try:
-                ds_stream = load_dataset(name, split='test', streaming=True)
+                ds_stream = load_dataset(name, split='test', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
             except Exception as e2:
                 print(f"Skipping dataset {name} during vocabulary build. Errors: {e1}, {e2}")
                 continue
