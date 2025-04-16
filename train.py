@@ -7,13 +7,16 @@ Training script for the UnifiedMultimodalModel.
 - Builds a custom tokenizer (from tokenizer.py) using sample texts.
 - Loads and preprocesses the data via a unified MultiModalDataset.
 - Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC with gating, advanced chain-of-thought generation,
-  custom multi-head latent attention, Deepseeks Reasoning) until a target performance is reached.
+  custom multi-head latent attention, Deepseeks Reasoning) until target performance is reached.
 - Displays extensive information on datasets, model configuration (parameters, memory, subject knowledge),
   and training status.
 - Configures GPU to use 95% of its memory.
 """
 
-import os, threading, random, json
+import os
+import threading
+import random
+import json
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
@@ -81,27 +84,27 @@ training_datasets = [
     "wikimedia/Encyclopedia_Britannica_1911",
     "github/VSCode_Extensions",
     "opensource/Windows_Command_Line_Scripts",
-    # Additional large-scale text corpora
+    # Additional large-scale text corpora for self-supervision
     "c4",
     "the_pile",
     "redpajama",
     # Long-context and memory
     "pg19",
     "narrative_qa",
-    # Reasoning / Chain-of-Thought datasets
+    # Reasoning/Chain-of-Thought datasets
     "gsm8k",
     "math",
-    "chain_of_thought",        # chain-of-thought reasoning collection
-    "deepseek_synthetic_cot",   # DeepSeek synthetic CoT
+    "chain_of_thought",
+    "deepseek_synthetic_cot",
     "arc", "strategyqa",
-    # Retrieval & Knowledge
+    # Retrieval and Knowledge
     "natural_questions",
     "trivia_qa",
     "hotpot_qa",
     "fever",
     "eli5",
     "wizard_of_wikipedia",
-    # Dialogue & Instruction Tuning
+    # Dialogue and Instruction Tuning
     "oasst1",
     "super_natural_instructions",
     "toolformer",
@@ -173,18 +176,22 @@ class MultiModalDataset(torch.utils.data.Dataset):
         total_length = 0
         for name in dataset_names:
             print(f"Downloading dataset: {name}")
-            # Attempt to load 'train' split; if not available, try 'test'
             try:
                 ds = load_dataset(name, split='train')
-            except Exception:
-                print(f"Dataset {name} does not have a 'train' split; trying 'test' split.")
-                ds = load_dataset(name, split='test')
+            except Exception as e1:
+                print(f"Dataset {name} cannot load 'train' split. Error: {e1}")
+                try:
+                    ds = load_dataset(name, split='test')
+                    print(f"Dataset {name} loaded with 'test' split.")
+                except Exception as e2:
+                    print(f"Skipping dataset {name} as neither 'train' nor 'test' splits are available. Error: {e2}")
+                    continue
             self.datasets.append(ds)
             self.dataset_names.append(name)
             total_length += len(ds)
             self.cumulative_lengths.append(total_length)
         self.total_length = total_length
-        # Save dataset info for logging
+        # Save dataset info
         dataset_info = {name: {"length": len(ds)} for name, ds in zip(self.dataset_names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
             json.dump(dataset_info, f, indent=2)
@@ -302,17 +309,16 @@ def train_model(model, dataloader, dataset_names, target_score, learning_rate, d
     overall_score = 0.0
     dataset_scores = {name: 0.0 for name in dataset_names}
     epoch = 0
+    # Log model configuration and parameter stats
     print("====== Model and Training Configuration ======")
-    print("Model Parameters:")
     total_params = sum(p.numel() for p in model.parameters())
-    print(f" - Total parameters: {total_params:,}")
-    # (Example: Compute estimate of 'knowledge size' in subjects, here dummy calculated as total_params/1e6)
+    print(f"Model Parameters: {total_params:,} parameters")
     knowledge_size = total_params / 1e6
-    print(f" - Knowledge size (M parameters): {knowledge_size:.2f}")
+    print(f"Estimated Knowledge Size: {knowledge_size:.2f}M parameters")
     print("Training Datasets:")
     for name in dataset_names:
         print(f" - {name}")
-    print("===============================================")
+    print("================================================")
     while overall_score < target_score:
         epoch += 1
         epoch_loss = 0.0
@@ -366,11 +372,16 @@ def main():
     global tokenizer
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
     sample_texts = []
+    # Build tokenizer vocabulary from available datasets; try 'train' then 'test' if needed.
     for name in training_datasets:
         try:
             ds_stream = load_dataset(name, split='train', streaming=True)
-        except Exception:
-            ds_stream = load_dataset(name, split='test', streaming=True)
+        except Exception as e1:
+            try:
+                ds_stream = load_dataset(name, split='test', streaming=True)
+            except Exception as e2:
+                print(f"Skipping dataset {name} during vocabulary build. Errors: {e1}, {e2}")
+                continue
         for i, ex in enumerate(ds_stream):
             for k, v in ex.items():
                 if isinstance(v, str):
