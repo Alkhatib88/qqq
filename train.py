@@ -97,20 +97,29 @@ training_datasets = [
 # Helper: Retry logic for loading datasets
 #####################################
 def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
-    use_token = os.environ.get("HF_AUTH_TOKEN", None)
+    """Attempt to load a dataset with retries and config fallback."""
+    use_token = os.environ.get("HF_AUTH_TOKEN")
     delay = init_delay
     for attempt in range(max_retries):
         try:
             return load_dataset(name, split=split, use_auth_token=use_token)
         except Exception as e:
             err = str(e)
-            # If the builder rejects use_auth_token, retry without it
+            # Retry without auth token if builder rejects it
             if "unexpected keyword argument 'use_auth_token'" in err:
                 return load_dataset(name, split=split)
+            # Handle missing cache/config errors by picking first available config
+            if "Couldn't find cache for" in err and "Available configs" in err:
+                builder = load_dataset_builder(name, use_auth_token=use_token)
+                cfg_name = builder.info.config_names[0]
+                print(f"Using config '{cfg_name}' for {name}.")
+                return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
+            # HTTP 429 rate limit
             if "429" in err:
                 print(f"Rate limited on {name}, retry {attempt+1}/{max_retries} in {delay}s...")
                 time.sleep(delay)
                 delay *= 2
+            # Try alternative config names
             elif "Config name is missing" in err:
                 try:
                     builder = load_dataset_builder(name, use_auth_token=use_token)
@@ -121,13 +130,14 @@ def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
                     print(f"Failed auto-config for {name}: {e}")
             else:
                 print(f"Error loading {name}: {e}")
-    # fallback to 'test' split
+    # Fallback to 'test' split if 'train' fails
     if split == 'train':
         try:
             return load_dataset(name, split='test', use_auth_token=use_token)
         except Exception as e_test:
             print(f"Failed fallback test split for {name}: {e_test}")
     raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
+
 
 #####################################
 # get_default_config()
@@ -181,15 +191,23 @@ class MultiModalDataset(torch.utils.data.Dataset):
             print(f"Downloading dataset: {name}")
             try:
                 ds = try_load_dataset(name, split='train')
-                length = len(ds) if hasattr(ds, "__len__") else 0
-                self.datasets.append(ds)
-                self.names.append(name)
-                total += length
-                self.cum_lengths.append(total)
-                print(f"  → Loaded {length} examples.")
+                length = len(ds) if hasattr(ds, '__len__') else 0
+                if length > 0:
+                    print(f"  ✔ {name}: {length} examples")
+                    self.datasets.append(ds)
+                    self.names.append(name)
+                    total += length
+                    self.cum_lengths.append(total)
+                else:
+                    print(f"  ✗ {name} has zero examples, skipping.")
             except Exception as e:
-                print(f"  ✗ Skipping {name}: {e}")
+                print(f"  ✗ {name}: {e}")
         self.total_length = total
+        if not self.datasets:
+            raise RuntimeError(
+                f"No datasets could be loaded from {dataset_names}. "
+                "Please check dataset names, your HF token, connectivity, or cache."
+            )
         info = {n: len(d) for n, d in zip(self.names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
             json.dump(info, f, indent=2)
