@@ -2,18 +2,16 @@
 """
 model.py
 
-UnifiedMultimodalModel: A fully integrated multimodal encoder-decoder that includes:
-  • Enhanced Sin/Cos Positional Encoding
-  • Modular and Robust Function Call Handling (with built-in File/Folder Manager, PDF Tool, and script execution)
-  • Dual Fusion Modules:
-       - CoreFusion: Fusing raw encoder features
-       - ExternalFusion: Fusing branch outputs
-  • Advanced Retrieval-Augmented Generation (RAG)
-  • Additional Encoder/Decoder Architectures (Transformer for text, 1D CNN for audio, 2D CNN for image, 3D CNN for video)
-  • Diffusion Module for image refinement
-  • Custom Multi-Head Latent Attention and Chain-of-Thought reasoning generator
-
-This file holds the complete model definitions and helper modules.
+UnifiedMultimodalModel: A fully integrated multimodal encoder-decoder with all advanced modules from scratch:
+  - Rotary Positional Encoding
+  - Custom KV Cache
+  - TitansMemoryMAC with gating (Memory as a Context)
+  - SelfTeachModule for reinforcement learning-based self-teaching
+  - Advanced Chain-of-Thought Generator (multiple sampling with log-probabilities)
+  - Custom Multi-Head Latent Attention (MLA) module
+  - Deepseeks Reasoning module
+  - Standard image, audio, video encoders/decoders and fusion modules
+  - Function Call Interface
 """
 
 import math, os
@@ -22,224 +20,181 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 #####################################
-# Enhanced Sin/Cos Positional Encoding
+# Rotary Positional Encoding
 #####################################
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=1024):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
-                             (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer('pe', pe)
+def apply_rotary_positional_encoding(x, seq_dim=1):
+    dim = x.size(-1)
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=x.device).float() / dim))
+    positions = torch.arange(x.size(seq_dim), device=x.device).float()
+    sinusoid = torch.einsum("i , j -> ij", positions, inv_freq)
+    sin = sinusoid.sin()[None, :, :]
+    cos = sinusoid.cos()[None, :, :]
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    x_rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return x_rot
+
+#####################################
+# RMSNorm
+#####################################
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super(RMSNorm, self).__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
     def forward(self, x):
-        return self.dropout(x + self.pe[:, :x.size(1)])
+        norm = x.pow(2).mean(-1, keepdim=True).sqrt() + self.eps
+        return self.weight * (x / norm)
 
 #####################################
-# Modular and Robust Function Call Interface
+# KV Cache Implementation
 #####################################
-class FunctionCaller:
+class KVCache:
     def __init__(self):
-        self.functions = {}
-        # Register default tools
-        self.register('build_script', self.build_script)
-        self.register('load_tool', self.load_tool)
-        self.register('file_manager', self.file_manager)
-        self.register('folder_manager', self.folder_manager)
-        self.register('pdf_tool', self.pdf_tool)
-        self.register('execute_script', self.execute_script)
-    def register(self, name, func):
-        self.functions[name] = func
-    def call(self, name, *args, **kwargs):
-        if name in self.functions:
-            return self.functions[name](*args, **kwargs)
+        self.cache = {}
+    def add(self, layer, key, value):
+        if layer not in self.cache:
+            self.cache[layer] = {"key": key, "value": value}
         else:
-            raise ValueError(f"Function '{name}' not registered.")
-    def build_script(self, script_name):
-        return f"Script '{script_name}' built successfully."
-    def load_tool(self, tool_name):
-        return f"Tool '{tool_name}' loaded successfully."
-    def file_manager(self, action, filepath, content=None):
-        if action == "read":
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    return f.read()
-            else:
-                return f"File '{filepath}' not found."
-        elif action == "write":
-            with open(filepath, 'w') as f:
-                f.write(content)
-            return f"File '{filepath}' written successfully."
-        else:
-            return "Unsupported file manager action."
-    def folder_manager(self, action, folderpath):
-        if action == "list":
-            if os.path.isdir(folderpath):
-                return os.listdir(folderpath)
-            else:
-                return f"Folder '{folderpath}' not found."
-        elif action == "create":
-            os.makedirs(folderpath, exist_ok=True)
-            return f"Folder '{folderpath}' created successfully."
-        else:
-            return "Unsupported folder manager action."
-    def pdf_tool(self, filepath):
-        if os.path.exists(filepath):
-            return f"PDF '{filepath}' processed successfully."
-        else:
-            return f"PDF '{filepath}' not found."
-    def execute_script(self, script_name):
-        return f"Script '{script_name}' executed successfully."
+            self.cache[layer]["key"] = torch.cat([self.cache[layer]["key"], key], dim=1)
+            self.cache[layer]["value"] = torch.cat([self.cache[layer]["value"], value], dim=1)
+    def get(self, layer):
+        return self.cache.get(layer, {"key": None, "value": None})
+    def reset(self):
+        self.cache = {}
 
 #####################################
-# Multi-Head Latent Attention Module
+# TitansMemoryMAC with Gating (Memory as a Context)
 #####################################
-class MultiHeadLatentAttention(nn.Module):
+class TitansMemoryMAC(nn.Module):
+    def __init__(self, memory_size, embedding_dim, num_heads=4):
+        super(TitansMemoryMAC, self).__init__()
+        self.memory = nn.Parameter(torch.randn(memory_size, embedding_dim))
+        self.attn = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.gate_fc = nn.Linear(embedding_dim * 2, embedding_dim)
+    def forward(self, x):
+        query = x.unsqueeze(1)  # (batch, 1, embedding_dim)
+        key = self.memory.unsqueeze(0).expand(x.size(0), -1, -1)  # (batch, memory_size, embedding_dim)
+        value = key
+        attn_output, _ = self.attn(query, key, value)  # (batch, 1, embedding_dim)
+        attn_output = attn_output.squeeze(1)  # (batch, embedding_dim)
+        # Concatenate input and memory output then compute gate
+        concat = torch.cat([x, attn_output], dim=1)  # (batch, 2*embedding_dim)
+        gate = torch.sigmoid(self.gate_fc(concat))  # (batch, embedding_dim)
+        gated_output = gate * attn_output
+        return gated_output
+
+#####################################
+# SelfTeach Module for Reinforcement Learning of Reasoning
+#####################################
+class SelfTeachModule(nn.Module):
+    def __init__(self, embed_dim):
+        super(SelfTeachModule, self).__init__()
+        # Critic network to predict a reward from a chain-of-thought embedding
+        self.critic = nn.Linear(embed_dim, 1)
+    def forward(self, cot_embedding):
+        # Returns a scalar reward per example
+        reward = self.critic(cot_embedding)
+        return reward
+
+#####################################
+# Custom Multi-Head Latent Attention (from scratch)
+#####################################
+class MultiHeadLatentAttentionCustom(nn.Module):
     def __init__(self, embed_dim, num_heads, latent_dim):
-        super(MultiHeadLatentAttention, self).__init__()
+        super(MultiHeadLatentAttentionCustom, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.latent_dim = latent_dim
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.kv_down = nn.Linear(embed_dim, latent_dim)
-        self.kv_up = nn.Linear(latent_dim, embed_dim * 2)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.W_q = nn.Linear(embed_dim, embed_dim)
+        self.W_k = nn.Linear(embed_dim, embed_dim)
+        self.W_v = nn.Linear(embed_dim, embed_dim)
+        # Up-projection for latent representation (to compress K, V)
+        self.latent_proj = nn.Linear(embed_dim, latent_dim)
+        self.out_proj = nn.Linear(latent_dim, embed_dim)
     def forward(self, x):
-        Q = self.q_proj(x)
-        latent = self.kv_down(x)
-        kv = self.kv_up(latent)
-        K, V = kv.split(self.embed_dim, dim=-1)
-        batch, seq_len, _ = x.size()
-        Q = Q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1,2)
-        K = K.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1,2)
-        V = V.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1,2)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # x: (batch, seq_len, embed_dim)
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+        # Project K into latent space
+        K_latent = self.latent_proj(K)
+        V_latent = self.latent_proj(V)
+        # Reshape for multi-head: (batch, num_heads, seq_len, head_dim) for Q
+        B, T, _ = Q.size()
+        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1,2)
+        # For latent K and V: (batch, num_heads, seq_len, latent_dim // num_heads)
+        latent_head_dim = self.latent_dim // self.num_heads
+        K_latent = K_latent.view(B, T, self.num_heads, latent_head_dim).transpose(1,2)
+        V_latent = V_latent.view(B, T, self.num_heads, latent_head_dim).transpose(1,2)
+        # Compute attention scores
+        scores = torch.matmul(Q, K_latent.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
-        out = out.transpose(1,2).contiguous().view(batch, seq_len, self.embed_dim)
-        return self.out_proj(out)
+        output = torch.matmul(attn, V_latent)
+        # Concatenate heads
+        output = output.transpose(1,2).contiguous().view(B, T, self.latent_dim)
+        # Project back to embed_dim
+        output = self.out_proj(output)
+        return output
 
 #####################################
-# Core Fusion Module: Fuse raw encoder features
+# Advanced Chain-of-Thought Generator (with multiple sampling from scratch)
 #####################################
-class CoreFusion(nn.Module):
-    def __init__(self, input_dims, fused_dim):
-        super(CoreFusion, self).__init__()
-        total_dim = sum(input_dims.values())
-        self.fc = nn.Linear(total_dim, fused_dim)
-        self.activation = nn.ReLU()
-    def forward(self, features_dict):
-        latents = [features_dict[k] for k in sorted(features_dict.keys())]
-        concat = torch.cat(latents, dim=1)
-        return self.activation(self.fc(concat))
-
-#####################################
-# External Fusion Module: Fuse branch outputs
-#####################################
-class ExternalFusion(nn.Module):
-    def __init__(self, branch_dims, fused_dim):
-        super(ExternalFusion, self).__init__()
-        total_dim = sum(branch_dims.values())
-        self.fc = nn.Linear(total_dim, fused_dim)
-        self.activation = nn.ReLU()
-    def forward(self, branch_outputs):
-        branches = [branch_outputs[k] for k in sorted(branch_outputs.keys())]
-        concat = torch.cat(branches, dim=1)
-        return self.activation(self.fc(concat))
-
-#####################################
-# Advanced Retrieval-Augmented Generation (RAG)
-#####################################
-class Retriever:
-    def __init__(self, documents):
-        self.documents = documents
-    def retrieve(self, query):
-        query = query.lower()
-        matches = [doc for doc in self.documents if any(word in doc.lower() for word in query.split())]
-        if not matches:
-            return self.documents[0]
-        return " ".join(matches)
-
-class RAGGenerator(nn.Module):
-    def __init__(self, generator, retriever):
-        super(RAGGenerator, self).__init__()
-        self.generator = generator
-        self.retriever = retriever
-    def forward(self, query_ids):
-        query_str = " ".join(map(str, query_ids[0].tolist()))
-        context = self.retriever.retrieve(query_str)
-        # Create a dummy context tensor (all ones) matching query_ids' shape
-        context_tensor = torch.ones_like(query_ids)
-        prompt = torch.cat([query_ids, context_tensor], dim=1)
-        generated_ids = self.generator.generate_with_prompt(prompt)
-        return generated_ids
-
-#####################################
-# Diffusion Module & Residual Block (for image refinement)
-#####################################
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = nn.BatchNorm2d(channels)
-    def forward(self, x):
-        residual = x
-        out = F.relu(self.norm1(self.conv1(x)))
-        out = self.norm2(self.conv2(out))
-        return F.relu(out + residual)
-
-class DiffusionModule(nn.Module):
-    def __init__(self, in_channels, model_channels=64, out_channels=None, num_res_blocks=2):
-        super(DiffusionModule, self).__init__()
-        if out_channels is None:
-            out_channels = in_channels
-        self.initial_conv = nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1)
-        self.res_blocks = nn.Sequential(*[ResidualBlock(model_channels) for _ in range(num_res_blocks)])
-        self.final_conv = nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1)
-    def forward(self, x):
-        h = self.initial_conv(x)
-        h = self.res_blocks(h)
-        return self.final_conv(h)
-
-#####################################
-# Additional Encoder/Decoder Architectures
-#####################################
-# Text Encoder and Decoder (Transformer-based with enhanced positional encoding)
-class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=512):
-        super(TextEncoder, self).__init__()
+class ChainOfThoughtGeneratorAdvanced(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=256, num_samples=5):
+        super(ChainOfThoughtGeneratorAdvanced, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_encoder = PositionalEncoding(embed_dim, max_len=max_len)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-    def forward(self, input_ids):
-        x = self.embed(input_ids)
-        x = self.pos_encoder(x)
-        return self.encoder(x)
-
-class TextDecoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=512):
-        super(TextDecoder, self).__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_encoder = PositionalEncoding(embed_dim, max_len=max_len)
         decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(embed_dim, vocab_size)
+        self.max_len = max_len
+        self.num_samples = num_samples
+
     def forward(self, tgt_ids, memory, tgt_mask=None, memory_mask=None):
         x = self.embed(tgt_ids)
-        x = self.pos_encoder(x)
-        dec_out = self.decoder(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-        return self.fc_out(dec_out)
+        x = apply_rotary_positional_encoding(x)
+        out = self.decoder(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
+        logits = self.fc_out(out)
+        return logits
 
-# Image Encoder and Decoder (using 2D CNN)
+    def generate_multiple(self, prompt_ids):
+        # Generate multiple chain-of-thought outputs using sampling
+        B, L = prompt_ids.size()
+        all_generated = []
+        all_log_probs = []
+        for sample in range(self.num_samples):
+            generated = prompt_ids.clone()
+            log_prob_sum = torch.zeros(B, 1, device=prompt_ids.device)
+            memory = apply_rotary_positional_encoding(self.embed(prompt_ids))
+            for _ in range(self.max_len - L):
+                logits = self.forward(generated, memory)
+                # Get the probabilities for the last token
+                probs = torch.softmax(logits[:, -1, :], dim=-1)
+                # Sample next token
+                next_token = torch.multinomial(probs, num_samples=1)
+                # Gather log probability
+                log_probs = torch.log(torch.gather(probs, 1, next_token) + 1e-8)
+                log_prob_sum += log_probs
+                generated = torch.cat([generated, next_token], dim=1)
+                # Stop if EOS token (assume token id 0 is EOS)
+                if (next_token == 0).all():
+                    break
+            all_generated.append(generated)
+            all_log_probs.append(log_prob_sum)
+        # Stack outputs: shape (num_samples, batch, seq_len), (num_samples, batch, 1)
+        all_generated = torch.stack(all_generated, dim=0)
+        all_log_probs = torch.stack(all_log_probs, dim=0)
+        return all_generated, all_log_probs
+
+    def generate_with_prompt(self, prompt_ids):
+        generated, log_probs = self.generate_multiple(prompt_ids)
+        return generated, log_probs
+
+#####################################
+# Standard Image, Audio, Video Encoder/Decoder Modules (as before)
+#####################################
 class ImageEncoder(nn.Module):
     def __init__(self, out_dim):
         super(ImageEncoder, self).__init__()
@@ -276,7 +231,6 @@ class ImageDecoder(nn.Module):
         x = x.view(B, 128, 8, 8)
         return self.deconv(x)
 
-# Audio Encoder and Decoder (using 1D CNN)
 class AudioEncoder(nn.Module):
     def __init__(self, out_dim):
         super(AudioEncoder, self).__init__()
@@ -286,7 +240,6 @@ class AudioEncoder(nn.Module):
             nn.Conv1d(16, 32, 15, stride=4, padding=7),
             nn.ReLU()
         )
-        # Updated to use 32*1000
         self.fc = nn.Linear(32 * 1000, out_dim)
     def forward(self, x):
         B = x.size(0)
@@ -311,7 +264,6 @@ class AudioDecoder(nn.Module):
         x = x.view(B, 32, 1000)
         return self.deconv(x)
 
-# Video Encoder and Decoder (using 3D CNN)
 class VideoEncoder(nn.Module):
     def __init__(self, out_dim):
         super(VideoEncoder, self).__init__()
@@ -333,7 +285,7 @@ class VideoDecoder(nn.Module):
     def __init__(self, in_dim, num_frames, frame_size):
         super(VideoDecoder, self).__init__()
         self.num_frames = num_frames
-        self.frame_size = frame_size  # (H, W)
+        self.frame_size = frame_size
         self.fc = nn.Linear(in_dim, 32 * num_frames * 8 * 8)
         self.deconv3d = nn.Sequential(
             nn.ConvTranspose3d(32, 32, kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)),
@@ -345,32 +297,43 @@ class VideoDecoder(nn.Module):
         )
     def forward(self, z):
         B = z.size(0)
-        x = self.fc(z)  # (B, 32*num_frames*8*8)
+        x = self.fc(z)
         x = x.view(B, 32, self.num_frames, 8, 8)
         return self.deconv3d(x)
 
 #####################################
-# Chain-of-Thought Generator (Transformer-based)
+# Transformer-Based Text Components
 #####################################
-class ChainOfThoughtGenerator(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=256):
-        super(ChainOfThoughtGenerator, self).__init__()
+class TextEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=512):
+        super(TextEncoder, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_encoder = PositionalEncoding(embed_dim, max_len=max_len)
+        self.max_len = max_len
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+        x = apply_rotary_positional_encoding(x)
+        return self.encoder(x)
+
+class TextDecoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=512):
+        super(TextDecoder, self).__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.max_len = max_len
         decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(embed_dim, vocab_size)
-        self.max_len = max_len
+        self.kv_cache = KVCache()
     def forward(self, tgt_ids, memory, tgt_mask=None, memory_mask=None):
         x = self.embed(tgt_ids)
-        x = self.pos_encoder(x)
-        out = self.decoder(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-        return self.fc_out(out)
+        x = apply_rotary_positional_encoding(x)
+        return self.fc_out(self.decoder(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask))
     def generate(self, prompt_ids):
-        B, seq_len = prompt_ids.size()
+        self.kv_cache.reset()
         generated = prompt_ids
-        memory = self.pos_encoder(self.embed(prompt_ids))
-        for _ in range(self.max_len - seq_len):
+        memory = apply_rotary_positional_encoding(self.embed(prompt_ids))
+        for _ in range(self.max_len - prompt_ids.size(1)):
             logits = self.forward(generated, memory)
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
@@ -381,7 +344,7 @@ class ChainOfThoughtGenerator(nn.Module):
         return self.generate(prompt_ids)
 
 #####################################
-# Unified Multimodal Model Definition
+# Unified Multimodal Model with All Advanced Modules
 #####################################
 class UnifiedMultimodalModel(nn.Module):
     def __init__(self, config):
@@ -405,10 +368,19 @@ class UnifiedMultimodalModel(nn.Module):
         self.video_encoder = VideoEncoder(config['video_latent_dim'])
         self.video_decoder = VideoDecoder(config['video_latent_dim'], config['video_num_frames'], config['video_frame_size'])
         # Diffusion module for image refinement
-        self.diffusion_module = DiffusionModule(in_channels=3, model_channels=64, out_channels=3, num_res_blocks=2)
-        # Projection layer to map flattened diffusion output to image latent space
+        self.diffusion_module = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
         self.diffusion_proj = nn.Linear(3 * 64 * 64, config['image_latent_dim'])
-        # Core Fusion: fuse raw encoder features
+        # Combine embeddings from all encoders
+        self.combined_projection = nn.Linear(
+            config['text_embed_dim'] + config['audio_latent_dim'] + config['image_latent_dim'] + config['video_latent_dim'],
+            config['text_embed_dim']
+        )
+        # Fusion modules
         input_dims = {
             "text": config['text_embed_dim'],
             "audio": config['audio_latent_dim'],
@@ -416,19 +388,24 @@ class UnifiedMultimodalModel(nn.Module):
             "video": config['video_latent_dim']
         }
         self.core_fusion = CoreFusion(input_dims, config['core_fused_dim'])
-        # External Fusion: fuse branch outputs
-        branch_dims = input_dims
-        self.external_fusion = ExternalFusion(branch_dims, config['external_fused_dim'])
-        # Multi-Head Latent Attention over fused external features
-        self.latent_attention = MultiHeadLatentAttention(config['external_fused_dim'], config['attention_num_heads'], config['attention_latent_dim'])
-        # Chain-of-Thought Generator for reasoning
-        self.cot_generator = ChainOfThoughtGenerator(config['text_vocab_size'], config['text_embed_dim'],
-                                                     config['cot_decoder_layers'], config['text_num_heads'],
-                                                     config['text_ff_dim'], max_len=config.get('cot_max_len',256))
-        # Advanced Retrieval-Augmented Generation (RAG)
+        self.external_fusion = ExternalFusion(input_dims, config['external_fused_dim'])
+        # Replace standard multihead attention with our custom latent attention module
+        self.latent_attention = MultiHeadLatentAttentionCustom(config['external_fused_dim'], config['attention_num_heads'], latent_dim=128)
+        # Advanced modules
+        self.titans_memory = TitansMemoryMAC(memory_size=256, embedding_dim=config['text_embed_dim'])
+        self.surprise_and_forget = SurpriseAndForget(embedding_dim=config['text_embed_dim'], threshold=0.5)
+        self.deepseeks_reasoning = DeepseeksReasoning(input_dim=config['text_embed_dim'], hidden_dim=256, num_layers=2)
+        # Advanced Chain-of-Thought Generator with multiple sampling
+        self.cot_generator = ChainOfThoughtGeneratorAdvanced(config['text_vocab_size'], config['text_embed_dim'],
+                                                               config['cot_decoder_layers'], config['text_num_heads'],
+                                                               config['text_ff_dim'], max_len=config.get('cot_max_len',256),
+                                                               num_samples=5)
+        # SelfTeach module for reinforcement learning-based reward shaping
+        self.selfteach = SelfTeachModule(config['text_embed_dim'])
+        # Retrieval Component
         self.retriever = Retriever(config.get('rag_documents', ["Default document content."]))
         self.rag_generator = RAGGenerator(self.cot_generator, self.retriever)
-        # Function caller with default tools
+        # Function caller
         self.func_caller = FunctionCaller()
     
     def forward(self, inputs):
@@ -456,111 +433,57 @@ class UnifiedMultimodalModel(nn.Module):
         if "video" in inputs:
             branch_features["video"] = self.video_encoder(inputs["video"])
             outputs["video_out"] = self.video_decoder(branch_features["video"])
-        # Core fusion: fuse raw encoder features
+        # Combine embeddings from all branches
+        combined = torch.cat([branch_features["text"], branch_features["audio"], branch_features["image"], branch_features["video"]], dim=1)
+        fused_embedding = self.combined_projection(combined)
+        outputs["combined_embedding"] = fused_embedding
+        # Apply Titan's Memory MAC with gating and then Surprise and Forget
+        memory_out = self.titans_memory(fused_embedding)
+        sf_embedding = self.surprise_and_forget(memory_out)
+        outputs["memory_filtered"] = sf_embedding
+        # Fusion modules
         core_fused = self.core_fusion(branch_features)
-        outputs["core_fused"] = core_fused
-        # External fusion: fuse branch outputs
         ext_fused = self.external_fusion(branch_features)
+        outputs["core_fused"] = core_fused
         outputs["external_fused"] = ext_fused
-        # Apply latent attention on fused external features (unsqueeze to simulate sequence)
-        attended = self.latent_attention(ext_fused.unsqueeze(1))
-        outputs["attended_fused"] = attended
-        # Advanced RAG and chain-of-thought generation if a query is provided
+        attn_input = ext_fused.unsqueeze(1)
+        attn_output = self.latent_attention(attn_input)
+        outputs["attended_fused"] = attn_output.squeeze(1)
+        # If query is provided, generate multiple chain-of-thoughts and apply SelfTeach
         if "query" in inputs:
+            # Generate multiple chain-of-thought paths and obtain log probabilities
+            generated_ids, log_probs = self.cot_generator.generate_with_prompt(inputs["query"])
+            # Compute an average embedding for each generated path
+            B = inputs["query"].size(0)
+            cot_embeds = []
+            for i in range(self.cot_generator.num_samples):
+                curr_ids = generated_ids[i]  # shape: (batch, seq_len)
+                embed = self.text_encoder.embed(curr_ids).mean(dim=1)  # (batch, embed_dim)
+                cot_embeds.append(embed)
+            cot_embeds = torch.stack(cot_embeds, dim=0)  # (num_samples, batch, embed_dim)
+            # Compute reward for each path using SelfTeach module
+            rewards = self.selfteach(cot_embeds.mean(dim=0))  # (batch, 1)
+            # For simplicity, select the highest rewarded path (this is a surrogate for full RL)
+            best_path_idx = torch.argmax(rewards, dim=0)  # (batch,)
+            best_paths = []
+            for b in range(B):
+                best_paths.append(generated_ids[best_path_idx[b], b])
+            best_paths = torch.stack(best_paths, dim=0)  # (batch, seq_len)
+            # Refine the best chain-of-thought using Deepseeks Reasoning
+            cot_embed = self.text_encoder.embed(best_paths).mean(dim=1)  # (batch, embed_dim)
+            refined_cot = self.deepseeks_reasoning(cot_embed)
+            outputs["cot_out"] = refined_cot
+            # Also produce RAG output (for retrieval-augmented generation)
             outputs["rag_out"] = self.rag_generator(inputs["query"])
-            outputs["cot_out"] = self.cot_generator.generate_with_prompt(inputs["query"])
+            # Optionally, output self-teach loss (here computed as negative reward * log probability)
+            outputs["selfteach_loss"] = - (log_probs.mean() * rewards.mean())
         return outputs
 
     def call_function(self, func_name, *args, **kwargs):
         return self.func_caller.call(func_name, *args, **kwargs)
 
-#####################################
-# Dummy Dataset for Training and Testing
-#####################################
-import random
-class DummyDataset(torch.utils.data.Dataset):
-    def __init__(self, num_samples, config):
-        self.num_samples = num_samples
-        self.vocab_size = config["text_vocab_size"]
-        self.seq_len = config.get("text_seq_len", 32)
-        self.image_size = config.get("image_size", (3, 64, 64))
-        self.audio_length = config.get("audio_output_length", 16000)
-        self.video_shape = (3, config.get("video_num_frames", 16), 
-                            config.get("video_frame_size", (64, 64))[0], 
-                            config.get("video_frame_size", (64, 64))[1])
-        # Get list of training dataset names from config for simulation purposes
-        self.sources = config.get("training_datasets", [])
-    def __len__(self):
-        return self.num_samples
-    def __getitem__(self, idx):
-        sample = {}
-        sample["text"] = torch.randint(0, self.vocab_size, (self.seq_len,))
-        sample["audio"] = torch.randn(1, self.audio_length)
-        sample["image"] = torch.randn(*self.image_size)
-        sample["video"] = torch.randn(*self.video_shape)
-        sample["query"] = torch.randint(0, self.vocab_size, (self.seq_len,))
-        # Add a 'source' field randomly chosen from the training dataset list
-        sample["source"] = random.choice(self.sources) if self.sources else "dummy_source"
-        return sample
-
-#####################################
-# Default Configuration Function
-#####################################
-def get_default_config():
-    training_datasets = [
-        "Multimodal-Fatima/VQAv2_sample_train",
-        "Multimodal-Fatima/OxfordFlowers_test",
-        "matlok/multimodal-python-copilot-training-overview",
-        "notbadai/python_functions_reasoning",
-        "espejelomar/code_search_net_python_10000_examples",
-        "reshinthadith/synthetic_program_synthesis_python_1M",
-        "suriyagunasekar/stackoverflow-python-with-meta-data",
-        "Sridevi/python_textbooks",
-        "nuprl/stack-dedup-python-testgen-starcoder-filter-v2",
-        "nvidia/OpenCodeReasoning",
-        "nvidia/Llama-Nemotron-Post-Training-Dataset",
-        "open-thoughts/OpenThoughts2-1M",
-        "glaiveai/reasoning-v1-20m",
-        "emilbiju/Execution-Dagger-Data-Math-think",
-        "wikimedia/wikipedia",
-        "FreedomIntelligence/medical-o1-reasoning-SFT",
-        "facebook/natural_reasoning",
-        "KingNish/reasoning-base-20k",
-        "ProlificAI/social-reasoning-rlhf",
-        "dvilasuero/natural-science-reasoning",
-        "smirki/UI_Reasoning_Dataset",
-        "reasoning-machines/gsm-hard",
-        "di-zhang-fdu/R1-Vision-Reasoning-Instructions",
-        "lightblue/reasoning-multilingual-R1-Llama-70B-train",
-        "prithivMLmods/Deepthink-Reasoning",
-        "Nan-Do/SPP_30K_reasoning_tasks",
-        "davanstrien/reasoning-required",
-        "antiven0m/physical-reasoning-dpo",
-        "isaiahbjork/cot-logic-reasoning",
-        "efficientscaling/Z1-Code-Reasoning-107K",
-        "iamtarun/python_code_instructions_18k_alpaca",
-        "flytech/python-codes-25k",
-        "Vezora/Tested-143k-Python-Alpaca",
-        "semeru/code-text-python",
-        "microsoft/LCC_python",
-        "thomwolf/github-python",
-        "Jofthomas/hermes-function-calling-thinking-V1",
-        "UCSC-VLAA/VLAA-Thinking",
-        "minchyeom/thinker-formatted",
-        "fhai50032/GPQA-Thinking-O1",
-        "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
-        "Salesforce/xlam-function-calling-60k",
-        "unrealengine/UnrealEngineDocumentation",
-        "epicgames/UE5_Blueprint",
-        "voxelplugin/UE_Voxel_Plugin_Samples",
-        "blender/BlenderPythonAPI",
-        "scriptingtools/SublimeTextConfigs",
-        "news/History_and_News_Corpus",
-        "wikimedia/Encyclopedia_Britannica_1911",
-        "github/VSCode_Extensions",
-        "opensource/Windows_Command_Line_Scripts"
-    ]
-    return {
+if __name__ == "__main__":
+    config = {
         "text_vocab_size": 10000,
         "text_embed_dim": 512,
         "text_encoder_layers": 2,
@@ -587,10 +510,7 @@ def get_default_config():
             "Document 3: Retrieval augmented generation in AI."
         ],
         "image_size": (3, 64, 64),
-        "training_datasets": training_datasets
+        "training_datasets": []  # will be set in train.py
     }
-
-if __name__ == "__main__":
-    config = get_default_config()
     model = UnifiedMultimodalModel(config)
     print("UnifiedMultimodalModel instantiated successfully.")
