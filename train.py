@@ -6,9 +6,10 @@ Training script for the UnifiedMultimodalModel.
 - Downloads real datasets from Hugging Face based on an extended comprehensive training_datasets list.
 - Builds a custom tokenizer (from tokenizer.py) using sample texts.
 - Loads and preprocesses the data via a unified MultiModalDataset.
-- Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC, chain-of-thought generation, custom MLA, etc.)
-  until target performance is reached.
+- Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC with gating, advanced chain-of-thought generation,
+  custom multi-head latent attention, Deepseeks Reasoning) until a target performance is reached.
 - Reports dataset download status, per-dataset scores, and an overall score.
+- Configures GPU to use 95% of its memory.
 """
 
 import os, threading, random
@@ -20,22 +21,14 @@ from tqdm import tqdm
 from datasets import load_dataset
 from torchvision import transforms
 
-from model import UnifiedMultimodalModel, get_default_config
+from model import UnifiedMultimodalModel
 from tokenizer import SimpleTokenizer
 
 #####################################
 # Extended Training Datasets List
 #####################################
-# We recover our old dataset list and add additional datasets to support:
-# - Long-context learning (PG19, C4)
-# - Reasoning/Chain-of-Thought (GSM8K, MATH, Chain-of-Thought Collection)
-# - Retrieval/Knowledge (Natural Questions, TriviaQA, HotpotQA, FEVER, ELI5, Wizard of Wikipedia)
-# - Dialogue/Instruction (OASST1, SuperNaturalInstructions, Toolformer)
-# - Vision (LAION, COCO Captions, VQA v2, DocVQA)
-# - Audio (LibriSpeech, Common Voice, AudioSet, AudioCaps, Speech Commands)
-# - Video (WebVid-10M, MSR-VTT, TVQA, Ego4D)
 training_datasets = [
-    # Old list (multimodal, coding, reasoning, and more)
+    # Old list (multimodal, coding, reasoning, etc.)
     "Multimodal-Fatima/VQAv2_sample_train",
     "Multimodal-Fatima/OxfordFlowers_test",
     "matlok/multimodal-python-copilot-training-overview",
@@ -87,39 +80,50 @@ training_datasets = [
     "wikimedia/Encyclopedia_Britannica_1911",
     "github/VSCode_Extensions",
     "opensource/Windows_Command_Line_Scripts",
-    # Additional datasets for self-teaching, reasoning, retrieval, vision, audio, video
-    "c4",                          # Large-scale web text
-    "the_pile",                    # Massive text corpus
-    "pg19",                        # Long-context book texts
-    "gsm8k",                       # Grade-school math word problems
-    "math",                        # Competition-level math problems
-    "narrative_qa",                # Story-based QA
-    "hotpot_qa",                   # Multi-hop question answering
-    "natural_questions",           # Open-domain QA with long contexts
-    "trivia_qa",                   # Trivia questions with evidence
-    "fever",                       # Fact verification
-    "eli5",                        # Explain Like I'm Five questions
-    "wizard_of_wikipedia",         # Knowledge-grounded dialogue QA
-    "oasst1",                      # OpenAssistant Conversations
-    "super_natural_instructions",  # Broad instruction tuning
-    "toolformer",                  # Tool use demonstrations
-    "laion_aesthetic",             # Vision-text pairs (subset of LAION)
-    "coco_captions",               # Image captioning (MS COCO)
-    "vqa_v2",                      # Visual question answering v2
-    "docvqa",                      # Document QA with OCR
-    "librispeech_asr",             # Speech transcription
-    "common_voice",                # Multilingual speech dataset
-    "audioset",                    # Sound event recognition
-    "audiocaps",                   # Audio captioning
-    "speech_commands",             # Keyword spotting
-    "webvid",                      # Video-text pairs (WebVid-10M style)
-    "msrvtt",                      # Video captioning (MSR-VTT)
-    "tvqa",                        # Video QA from TV shows
-    "ego4d"                        # First-person video for episodic memory
+    # Additional large-scale text corpora for self-supervision
+    "c4",
+    "the_pile",
+    "redpajama",
+    # Long-context and memory
+    "pg19",
+    "narrative_qa",
+    # Reasoning/Chain-of-Thought datasets
+    "gsm8k",
+    "math",
+    "chain_of_thought",        # Assuming a dataset collection for chain-of-thought reasoning
+    "deepseek_synthetic_cot",   # Synthetic chain-of-thought data from DeepSeek
+    "arc", "strategyqa",
+    # Retrieval and Knowledge
+    "natural_questions",
+    "trivia_qa",
+    "hotpot_qa",
+    "fever",
+    "eli5",
+    "wizard_of_wikipedia",
+    # Dialogue and Instruction Tuning
+    "oasst1",
+    "super_natural_instructions",
+    "toolformer",
+    # Vision
+    "laion_aesthetic",
+    "coco_captions",
+    "vqa_v2",
+    "docvqa",
+    # Audio
+    "librispeech_asr",
+    "common_voice",
+    "audioset",
+    "audiocaps",
+    "speech_commands",
+    # Video
+    "webvid",
+    "msrvtt",
+    "tvqa",
+    "ego4d"
 ]
 
 #####################################
-# Update get_default_config() to include the new dataset list
+# get_default_config() Updated
 #####################################
 def get_default_config():
     return {
@@ -282,7 +286,7 @@ def multimodal_collate(batch):
     return collated
 
 #####################################
-# Advanced Training Loop with SelfTeach loss and Detailed Reporting
+# Advanced Training Loop with SelfTeach Loss and Detailed Reporting
 #####################################
 def train_model(model, dataloader, dataset_names, target_score, learning_rate, device):
     optimizer = Adam(model.parameters(), lr=learning_rate)

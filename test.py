@@ -4,7 +4,7 @@ test.py
 
 Interactive test script for the UnifiedMultimodalModel.
 Loads the trained model and tokenizer, then enters an interactive chat loop.
-Supports commands (build_script, execute_script).
+Commands for function calls are supported.
 Type 'bye' to exit.
 """
 
