@@ -127,6 +127,40 @@ training_datasets = [
 ]
 
 #####################################
+# get_default_config() Updated
+#####################################
+def get_default_config():
+    return {
+        "text_vocab_size": 10000,
+        "text_embed_dim": 512,
+        "text_encoder_layers": 2,
+        "text_decoder_layers": 2,
+        "text_num_heads": 8,
+        "text_ff_dim": 1024,
+        "text_max_len": 128,
+        "text_seq_len": 32,
+        "audio_latent_dim": 256,
+        "audio_output_length": 16000,
+        "image_latent_dim": 256,
+        "video_latent_dim": 256,
+        "video_num_frames": 16,
+        "video_frame_size": (64, 64),
+        "core_fused_dim": 512,
+        "external_fused_dim": 512,
+        "attention_num_heads": 8,
+        "attention_latent_dim": 128,
+        "cot_decoder_layers": 2,
+        "cot_max_len": 128,
+        "rag_documents": [
+            "Document 1: Advanced multimodal techniques.",
+            "Document 2: Chain-of-thought reasoning improves performance.",
+            "Document 3: Retrieval augmented generation in AI."
+        ],
+        "image_size": (64, 64),  # Note: torchvision.transforms.Resize requires a 2-value tuple.
+        "training_datasets": training_datasets
+    }
+
+#####################################
 # Helper Function: Try Loading a Dataset with Retries
 #####################################
 def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
@@ -154,21 +188,20 @@ def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
             else:
                 print(f"Error loading dataset {name} (split={split}): {e}")
         # Try next attempt
-    # If failed with train, try test split as a fallback
+    # If failed with train, try test split as a fallback (if not already trying 'test')
     if split == 'train':
         try:
             ds = load_dataset(name, split='test', use_auth_token=use_token)
             return ds
         except Exception as e_test:
             print(f"Failed to load dataset {name} with split 'test': {e_test}")
-    # If still failing, raise the error to signal dataset load failure.
     raise Exception(f"Failed to load dataset {name} after {max_retries} attempts.")
 
 #####################################
 # MultiModalDataset Implementation (No Dummy Fallback)
 #####################################
 class MultiModalDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_names, tokenizer, image_size=(224, 224)):
+    def __init__(self, dataset_names, tokenizer, image_size=(64, 64)):
         self.tokenizer = tokenizer
         self.image_transform = transforms.Compose([
             transforms.Resize(image_size),
@@ -187,6 +220,7 @@ class MultiModalDataset(torch.utils.data.Dataset):
                 length = len(ds) if hasattr(ds, "__len__") else 0
                 total_length += length
                 self.cumulative_lengths.append(total_length)
+                print(f"Loaded dataset {name} with {length} examples.")
             except Exception as e:
                 print(f"Error: Skipping dataset {name} due to error: {e}")
         self.total_length = total_length
@@ -206,7 +240,6 @@ class MultiModalDataset(torch.utils.data.Dataset):
                 try:
                     example = self.datasets[ds_idx][sample_index]
                 except Exception:
-                    # Should not occur since we skip failed datasets
                     example = {"text": ""}
                 break
         item = {}
@@ -283,7 +316,7 @@ def multimodal_collate(batch):
         for item in batch:
             img = item.get('image')
             if img is None:
-                img = torch.zeros(3, 224, 224)
+                img = torch.zeros(3, 64, 64)
             images.append(img)
         collated['image'] = torch.stack(images)
     if 'audio' in batch[0]:
@@ -394,7 +427,7 @@ def main():
             if i >= 500:
                 break
     tokenizer.fit_on_texts(sample_texts)
-    dataset = MultiModalDataset(training_datasets, tokenizer, image_size=config.get("image_size", (224, 224)))
+    dataset = MultiModalDataset(training_datasets, tokenizer, image_size=config.get("image_size", (64, 64)))
     num_workers = os.cpu_count() if os.cpu_count() is not None else 4
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=multimodal_collate)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
