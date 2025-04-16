@@ -12,10 +12,6 @@ Training script for the UnifiedMultimodalModel.
 - Configures GPU to use 95% of its memory.
 """
 
-HF_TOKEN = ""
-os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
-
-
 import os
 import time
 import threading
@@ -33,25 +29,29 @@ from model import UnifiedMultimodalModel
 from tokenizer import SimpleTokenizer
 
 #####################################
+# Hugging Face Authentication Token
+#####################################
+HF_TOKEN = "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"
+os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
+
+#####################################
 # Extended Training Datasets List
 #####################################
 training_datasets = [
+    # core Python reasoning/code corpora
     "Multimodal-Fatima/VQAv2_sample_train",
     "Multimodal-Fatima/OxfordFlowers_test",
-    "matlok/multimodal-python-copilot-training-overview",
     "notbadai/python_functions_reasoning",
     "espejelomar/code_search_net_python_10000_examples",
     "reshinthadith/synthetic_program_synthesis_python_1M",
     "suriyagunasekar/stackoverflow-python-with-meta-data",
     "Sridevi/python_textbooks",
     "nuprl/stack-dedup-python-testgen-starcoder-filter-v2",
+    # multimodal & reasoning
     "nvidia/OpenCodeReasoning",
-    "nvidia/Llama-Nemotron-Post-Training-Dataset",
     "open-thoughts/OpenThoughts2-1M",
     "glaiveai/reasoning-v1-20m",
     "emilbiju/Execution-Dagger-Data-Math-think",
-    "wikimedia/wikipedia",
-    "FreedomIntelligence/medical-o1-reasoning-SFT",
     "facebook/natural_reasoning",
     "KingNish/reasoning-base-20k",
     "ProlificAI/social-reasoning-rlhf",
@@ -73,64 +73,64 @@ training_datasets = [
     "microsoft/LCC_python",
     "thomwolf/github-python",
     "Jofthomas/hermes-function-calling-thinking-V1",
-    "UCSC-VLAA/VLAA-Thinking",
     "minchyeom/thinker-formatted",
     "fhai50032/GPQA-Thinking-O1",
     "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
-    "Salesforce/xlam-function-calling-60k",
-    "unrealengine/UnrealEngineDocumentation",
-    "epicgames/UE5_Blueprint",
-    "voxelplugin/UE_Voxel_Plugin_Samples",
-    "blender/BlenderPythonAPI",
-    "scriptingtools/SublimeTextConfigs",
-    "news/History_and_News_Corpus",
-    "wikimedia/Encyclopedia_Britannica_1911",
-    "github/VSCode_Extensions",
-    "opensource/Windows_Command_Line_Scripts",
-    # Additional large-scale text corpora
-    "c4",
-    "the_pile",
-    "redpajama",
-    # Long-context and memory
-    "pg19",
-    "narrative_qa",
-    # Reasoning / Chain-of-Thought datasets
-    "gsm8k",
-    "math",
-    "chain_of_thought",
-    "deepseek_synthetic_cot",
-    "arc", "strategyqa",
-    # Retrieval and Knowledge
-    "natural_questions",
-    "trivia_qa",
-    "hotpot_qa",
-    "fever",
-    "eli5",
-    "wizard_of_wikipedia",
-    # Dialogue and Instruction Tuning
-    "oasst1",
-    "super_natural_instructions",
-    "toolformer",
-    # Vision
-    "laion_aesthetic",
-    "coco_captions",
-    "vqa_v2",
-    "docvqa",
-    # Audio
-    "librispeech_asr",
-    "common_voice",
-    "audioset",
-    "audiocaps",
-    "speech_commands",
-    # Video
-    "webvid",
-    "msrvtt",
-    "tvqa",
-    "ego4d"
+    # gated or unavailable (commented out)
+    # "matlok/multimodal-python-copilot-training-overview",
+    # "nvidia/Llama-Nemotron-Post-Training-Dataset",
+    # "wikimedia/wikipedia",
+    # "FreedomIntelligence/medical-o1-reasoning-SFT",
+    # "Salesforce/xlam-function-calling-60k",
+    # "unrealengine/UnrealEngineDocumentation",
+    # "epicgames/UE5_Blueprint",
+    # "voxelplugin/UE_Voxel_Plugin_Samples",
+    # "blender/BlenderPythonAPI",
+    # "scriptingtools/SublimeTextConfigs",
+    # "news/History_and_News_Corpus",
+    # "wikimedia/Encyclopedia_Britannica_1911",
+    # "github/VSCode_Extensions",
+    # "opensource/Windows_Command_Line_Scripts",
 ]
 
 #####################################
-# get_default_config() 
+# Helper: Retry logic for loading datasets
+#####################################
+def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
+    use_token = os.environ.get("HF_AUTH_TOKEN", None)
+    delay = init_delay
+    for attempt in range(max_retries):
+        try:
+            return load_dataset(name, split=split, use_auth_token=use_token)
+        except Exception as e:
+            err = str(e)
+            # If the builder rejects use_auth_token, retry without it
+            if "unexpected keyword argument 'use_auth_token'" in err:
+                return load_dataset(name, split=split)
+            if "429" in err:
+                print(f"Rate limited on {name}, retry {attempt+1}/{max_retries} in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+            elif "Config name is missing" in err:
+                try:
+                    builder = load_dataset_builder(name, use_auth_token=use_token)
+                    cfg_name = builder.info.config_names[0]
+                    print(f"Using config '{cfg_name}' for {name}.")
+                    return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
+                except Exception:
+                    print(f"Failed auto-config for {name}: {e}")
+            else:
+                print(f"Error loading {name}: {e}")
+    # fallback to 'test' split
+    if split == 'train':
+        try:
+            return load_dataset(name, split='test', use_auth_token=use_token)
+        except Exception as e_test:
+            print(f"Failed fallback test split for {name}: {e_test}")
+    raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
+
+#####################################
+# get_default_config()
 #####################################
 def get_default_config():
     return {
@@ -159,41 +159,9 @@ def get_default_config():
             "Document 2: Chain-of-thought reasoning improves performance.",
             "Document 3: Retrieval augmented generation in AI."
         ],
-        "image_size": (64, 64),  # torchvision.transforms.Resize uses (H, W)
+        "image_size": (64, 64),
         "training_datasets": training_datasets
     }
-
-#####################################
-# Helper: Retry logic for loading datasets
-#####################################
-def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
-    use_token = os.environ.get("HF_AUTH_TOKEN", None)
-    delay = init_delay
-    for attempt in range(max_retries):
-        try:
-            return load_dataset(name, split=split, use_auth_token=use_token)
-        except Exception as e:
-            err = str(e)
-            if "429" in err:
-                print(f"Rate limited on {name}, retry {attempt+1}/{max_retries} in {delay}s...")
-                time.sleep(delay)
-                delay *= 2
-            elif "Config name is missing" in err:
-                try:
-                    builder = load_dataset_builder(name, use_auth_token=use_token)
-                    cfg_name = builder.info.config_names[0]
-                    print(f"Using config '{cfg_name}' for {name}.")
-                    return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
-                except Exception:
-                    print(f"Failed auto-config for {name}: {e}")
-            else:
-                print(f"Error loading {name}: {e}")
-    if split == 'train':
-        try:
-            return load_dataset(name, split='test', use_auth_token=use_token)
-        except Exception as e_test:
-            print(f"Failed fallback test split for {name}: {e_test}")
-    raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
 
 #####################################
 # MultiModalDataset
@@ -372,13 +340,12 @@ def train_model(model, dataloader, dataset_names, target_score, lr, device):
 #####################################
 def main():
     config = get_default_config()
-    # override training_datasets from top-level
     config["training_datasets"] = training_datasets
 
     global tokenizer
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
 
-    # Build vocab
+    # Build vocab via streaming samples
     sample_texts = []
     for name in training_datasets:
         try:
