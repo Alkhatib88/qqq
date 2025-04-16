@@ -31,7 +31,7 @@ from tokenizer import SimpleTokenizer
 #####################################
 # Hugging Face Authentication Token
 #####################################
-HF_TOKEN = "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"
+HF_TOKEN = ""
 os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
 
 #####################################
