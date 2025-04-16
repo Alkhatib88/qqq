@@ -14,8 +14,6 @@ Training script for the UnifiedMultimodalModel.
 
 import os
 import time
-import threading
-import random
 import json
 import torch
 from torch.optim import Adam
@@ -36,8 +34,10 @@ os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
 
 #####################################
 # Extended Training Datasets List
+# Include a guaranteed fallback dataset to ensure at least one loads
 #####################################
 training_datasets = [
+    "ag_news",  # fallback dataset that always exists
     # core Python reasoning/code corpora
     "Multimodal-Fatima/VQAv2_sample_train",
     "Multimodal-Fatima/OxfordFlowers_test",
@@ -76,21 +76,6 @@ training_datasets = [
     "minchyeom/thinker-formatted",
     "fhai50032/GPQA-Thinking-O1",
     "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
-    # gated or unavailable (commented out)
-    # "matlok/multimodal-python-copilot-training-overview",
-    # "nvidia/Llama-Nemotron-Post-Training-Dataset",
-    # "wikimedia/wikipedia",
-    # "FreedomIntelligence/medical-o1-reasoning-SFT",
-    # "Salesforce/xlam-function-calling-60k",
-    # "unrealengine/UnrealEngineDocumentation",
-    # "epicgames/UE5_Blueprint",
-    # "voxelplugin/UE_Voxel_Plugin_Samples",
-    # "blender/BlenderPythonAPI",
-    # "scriptingtools/SublimeTextConfigs",
-    # "news/History_and_News_Corpus",
-    # "wikimedia/Encyclopedia_Britannica_1911",
-    # "github/VSCode_Extensions",
-    # "opensource/Windows_Command_Line_Scripts",
 ]
 
 #####################################
@@ -138,41 +123,6 @@ def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
             print(f"Failed fallback test split for {name}: {e_test}")
     raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
 
-
-#####################################
-# get_default_config()
-#####################################
-def get_default_config():
-    return {
-        "text_vocab_size": 10000,
-        "text_embed_dim": 512,
-        "text_encoder_layers": 2,
-        "text_decoder_layers": 2,
-        "text_num_heads": 8,
-        "text_ff_dim": 1024,
-        "text_max_len": 128,
-        "text_seq_len": 32,
-        "audio_latent_dim": 256,
-        "audio_output_length": 16000,
-        "image_latent_dim": 256,
-        "video_latent_dim": 256,
-        "video_num_frames": 16,
-        "video_frame_size": (64, 64),
-        "core_fused_dim": 512,
-        "external_fused_dim": 512,
-        "attention_num_heads": 8,
-        "attention_latent_dim": 128,
-        "cot_decoder_layers": 2,
-        "cot_max_len": 128,
-        "rag_documents": [
-            "Document 1: Advanced multimodal techniques.",
-            "Document 2: Chain-of-thought reasoning improves performance.",
-            "Document 3: Retrieval augmented generation in AI."
-        ],
-        "image_size": (64, 64),
-        "training_datasets": training_datasets
-    }
-
 #####################################
 # MultiModalDataset
 #####################################
@@ -204,10 +154,19 @@ class MultiModalDataset(torch.utils.data.Dataset):
                 print(f"  ✗ {name}: {e}")
         self.total_length = total
         if not self.datasets:
-            raise RuntimeError(
-                f"No datasets could be loaded from {dataset_names}. "
-                "Please check dataset names, your HF token, connectivity, or cache."
-            )
+            # Final fallback: load a small portion of the fallback dataset streaming
+            fb = training_datasets[0]
+            print(f"No datasets loaded; falling back to streaming '{fb}' for 1000 examples.")
+            stream = load_dataset(fb, split='train', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
+            samples = []
+            for i, ex in enumerate(stream):
+                samples.append(ex)
+                if i >= 999:
+                    break
+            self.datasets = [samples]
+            self.names = [fb + "_stream"]
+            self.cum_lengths = [len(samples)]
+            self.total_length = len(samples)
         info = {n: len(d) for n, d in zip(self.names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
             json.dump(info, f, indent=2)
@@ -227,10 +186,12 @@ class MultiModalDataset(torch.utils.data.Dataset):
             if isinstance(v, str):
                 if k.lower() in ["question", "prompt", "input", "query"]:
                     text_in = (text_in or "") + v
-                elif k.lower() in ["answer", "response", "output", "reasoning", "multiple_choice_answer"]:
+                elif k.lower() in ["answer", "response", "output"]:
                     text_out = (text_out or "") + v
                 else:
                     text_in = (text_in or "") + v
+            elif k.lower() == "text":
+                text_in = (text_in or "") + v
             elif k.lower() == "image" and v is not None:
                 item["image"] = self.image_transform(v if not isinstance(v, dict) else v.get("pil", v))
             elif k.lower() == "audio" and v is not None:
@@ -251,31 +212,21 @@ class MultiModalDataset(torch.utils.data.Dataset):
 #####################################
 def multimodal_collate(batch):
     collated = {}
-    # text
     if "input_ids" in batch[0]:
         max_len = max(b["input_ids"].size(0) for b in batch)
         pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
         collated["input_ids"] = torch.stack([
-            torch.cat([b["input_ids"],
-                       pad[b["input_ids"].size(0):]]) for b in batch
+            torch.cat([b["input_ids"], pad[b["input_ids"].size(0):]]) for b in batch
         ])
     if "labels" in batch[0]:
         max_len = max(b["labels"].size(0) for b in batch)
         pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
         collated["labels"] = torch.stack([
-            torch.cat([b["labels"],
-                       pad[b["labels"].size(0):]]) for b in batch
+            torch.cat([b["labels"], pad[b["labels"].size(0):]]) for b in batch
         ])
-    # image
     if "image" in batch[0]:
-        imgs = []
-        for b in batch:
-            if "image" in b:
-                imgs.append(b["image"])
-            else:
-                imgs.append(torch.zeros(3, *config["image_size"]))
+        imgs = [b.get("image", torch.zeros(3, *config["image_size"])) for b in batch]
         collated["image"] = torch.stack(imgs)
-    # audio
     if "audio" in batch[0]:
         max_a = max(b["audio"].size(0) for b in batch if "audio" in b)
         auds = []
@@ -288,7 +239,6 @@ def multimodal_collate(batch):
                 a = torch.zeros(max_a)
             auds.append(a)
         collated["audio"] = torch.stack(auds)
-    # video left as list
     if "video" in batch[0]:
         collated["video"] = [b.get("video") for b in batch]
     return collated
@@ -321,13 +271,13 @@ def train_model(model, dataloader, dataset_names, target_score, lr, device):
         print(f"--- Epoch {epoch} ---")
         bar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="batch")
         for batch in bar:
-            for k,v in batch.items():
+            for k, v in batch.items():
                 if torch.is_tensor(v):
                     batch[k] = v.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with autocast():
                 out = model(batch)
-                loss = 0.0
+                loss = torch.tensor(0.0, device=device)
                 if "text_out" in out and "input_ids" in batch:
                     logits = out["text_out"]
                     loss += criterion(logits.view(-1, logits.size(-1)), batch["input_ids"].view(-1))
@@ -357,8 +307,35 @@ def train_model(model, dataloader, dataset_names, target_score, lr, device):
 # Main Entry
 #####################################
 def main():
-    config = get_default_config()
-    config["training_datasets"] = training_datasets
+    config = {
+        "text_vocab_size": 10000,
+        "text_embed_dim": 512,
+        "text_encoder_layers": 2,
+        "text_decoder_layers": 2,
+        "text_num_heads": 8,
+        "text_ff_dim": 1024,
+        "text_max_len": 128,
+        "text_seq_len": 32,
+        "audio_latent_dim": 256,
+        "audio_output_length": 16000,
+        "image_latent_dim": 256,
+        "video_latent_dim": 256,
+        "video_num_frames": 16,
+        "video_frame_size": (64, 64),
+        "core_fused_dim": 512,
+        "external_fused_dim": 512,
+        "attention_num_heads": 8,
+        "attention_latent_dim": 128,
+        "cot_decoder_layers": 2,
+        "cot_max_len": 128,
+        "rag_documents": [
+            "Document 1: Advanced multimodal techniques.",
+            "Document 2: Chain-of-thought reasoning improves performance.",
+            "Document 3: Retrieval augmented generation in AI."
+        ],
+        "image_size": (64, 64),
+        "training_datasets": training_datasets
+    }
 
     global tokenizer
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
