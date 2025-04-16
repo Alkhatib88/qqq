@@ -84,14 +84,14 @@ training_datasets = [
     "wikimedia/Encyclopedia_Britannica_1911",
     "github/VSCode_Extensions",
     "opensource/Windows_Command_Line_Scripts",
-    # Additional large-scale text corpora for self-supervision
+    # Additional large-scale text corpora
     "c4",
     "the_pile",
     "redpajama",
     # Long-context and memory
     "pg19",
     "narrative_qa",
-    # Reasoning/Chain-of-Thought datasets
+    # Reasoning / Chain-of-Thought datasets
     "gsm8k",
     "math",
     "chain_of_thought",
@@ -127,7 +127,7 @@ training_datasets = [
 ]
 
 #####################################
-# get_default_config() Updated
+# get_default_config() Updated (Note: image_size as a 2-tuple)
 #####################################
 def get_default_config():
     return {
@@ -156,12 +156,12 @@ def get_default_config():
             "Document 2: Chain-of-thought reasoning improves performance.",
             "Document 3: Retrieval augmented generation in AI."
         ],
-        "image_size": (3, 64, 64),
+        "image_size": (224, 224),   # Changed to a valid 2-tuple for Resize
         "training_datasets": training_datasets
     }
 
 #####################################
-# MultiModalDataset Implementation
+# MultiModalDataset Implementation with Dummy Fallback
 #####################################
 class MultiModalDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_names, tokenizer, image_size=(224, 224)):
@@ -178,20 +178,22 @@ class MultiModalDataset(torch.utils.data.Dataset):
             print(f"Downloading dataset: {name}")
             try:
                 ds = load_dataset(name, split='train')
-            except Exception as e1:
-                print(f"Dataset {name} cannot load 'train' split. Error: {e1}")
+            except Exception as e_train:
+                print(f"Failed to load 'train' split for {name}: {e_train}")
                 try:
                     ds = load_dataset(name, split='test')
-                    print(f"Dataset {name} loaded with 'test' split.")
-                except Exception as e2:
-                    print(f"Skipping dataset {name} as neither 'train' nor 'test' splits are available. Error: {e2}")
-                    continue
+                    print(f"Loaded 'test' split for {name}.")
+                except Exception as e_test:
+                    print(f"Both 'train' and 'test' splits failed for {name}: {e_test}")
+                    # Instead of skipping, create a dummy dataset with one sample.
+                    ds = [{"text": "dummy", "image": None, "audio": None, "video": None}]
+                    print(f"Inserting dummy dataset for {name}.")
             self.datasets.append(ds)
             self.dataset_names.append(name)
             total_length += len(ds)
             self.cumulative_lengths.append(total_length)
         self.total_length = total_length
-        # Save dataset info
+        # Save dataset info for logging
         dataset_info = {name: {"length": len(ds)} for name, ds in zip(self.dataset_names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
             json.dump(dataset_info, f, indent=2)
@@ -229,8 +231,8 @@ class MultiModalDataset(torch.utils.data.Dataset):
                     item['image'] = None
                 else:
                     try:
-                        pil_img = value if not isinstance(value, dict) else value['pil']
-                    except:
+                        pil_img = value if not isinstance(value, dict) else value.get('pil', value)
+                    except Exception:
                         pil_img = value
                     item['image'] = self.image_transform(pil_img)
             elif key.lower() == "audio":
@@ -303,7 +305,7 @@ def multimodal_collate(batch):
 #####################################
 def train_model(model, dataloader, dataset_names, target_score, learning_rate, device):
     optimizer = Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
     scaler = GradScaler(device=device)
     model.train()
     overall_score = 0.0
@@ -338,11 +340,11 @@ def train_model(model, dataloader, dataset_names, target_score, learning_rate, d
                     target = batch["input_ids"]
                     loss += criterion(logits.view(-1, logits.size(-1)), target.view(-1))
                 if "audio_out" in outputs and "audio" in batch:
-                    loss += nn.MSELoss()(outputs["audio_out"], batch["audio"])
+                    loss += torch.nn.MSELoss()(outputs["audio_out"], batch["audio"])
                 if "image_out" in outputs and "image" in batch:
-                    loss += nn.MSELoss()(outputs["image_out"], batch["image"])
+                    loss += torch.nn.MSELoss()(outputs["image_out"], batch["image"])
                 if "video_out" in outputs and "video" in batch:
-                    loss += nn.MSELoss()(outputs["video_out"], batch["video"])
+                    loss += torch.nn.MSELoss()(outputs["video_out"], batch["video"])
                 if "selfteach_loss" in outputs:
                     loss += outputs["selfteach_loss"]
             scaler.scale(loss).backward()
@@ -372,7 +374,7 @@ def main():
     global tokenizer
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
     sample_texts = []
-    # Build tokenizer vocabulary from available datasets; try 'train' then 'test' if needed.
+    # Build vocabulary from available datasets (try 'train', fallback to 'test')
     for name in training_datasets:
         try:
             ds_stream = load_dataset(name, split='train', streaming=True)
