@@ -6,13 +6,16 @@ Training script for the UnifiedMultimodalModel.
 - Downloads real datasets from Hugging Face based on an extended comprehensive training_datasets list.
 - Builds a custom tokenizer (from tokenizer.py) using sample texts.
 - Loads and preprocesses the data via a unified MultiModalDataset.
-- Trains the model with advanced techniques until a target performance is reached.
-- Skips any dataset that errors and logs the exact exception.
+- Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC with gating, advanced chain-of-thought generation,
+  custom multi-head latent attention, Deepseeks Reasoning, etc.) until a target performance is reached.
+- Displays extensive information on model configuration, dataset status, model parameters, and training progress.
+- Configures GPU to use 95% of its memory.
 """
 
 import os
 import time
 import threading
+import random
 import json
 import torch
 from torch.optim import Adam
@@ -29,7 +32,6 @@ from tokenizer import SimpleTokenizer
 # Extended Training Datasets List
 #####################################
 training_datasets = [
-    # multimodal, coding, reasoning, etc.
     "Multimodal-Fatima/VQAv2_sample_train",
     "Multimodal-Fatima/OxfordFlowers_test",
     "matlok/multimodal-python-copilot-training-overview",
@@ -82,217 +84,336 @@ training_datasets = [
     "github/VSCode_Extensions",
     "opensource/Windows_Command_Line_Scripts",
     # Additional large-scale text corpora
-    "c4", "the_pile", "redpajama",
+    "c4",
+    "the_pile",
+    "redpajama",
     # Long-context and memory
-    "pg19", "narrative_qa",
+    "pg19",
+    "narrative_qa",
     # Reasoning / Chain-of-Thought datasets
-    "gsm8k","math","chain_of_thought","deepseek_synthetic_cot",
-    "arc","strategyqa",
+    "gsm8k",
+    "math",
+    "chain_of_thought",
+    "deepseek_synthetic_cot",
+    "arc", "strategyqa",
     # Retrieval and Knowledge
-    "natural_questions","trivia_qa","hotpot_qa","fever","eli5","wizard_of_wikipedia",
+    "natural_questions",
+    "trivia_qa",
+    "hotpot_qa",
+    "fever",
+    "eli5",
+    "wizard_of_wikipedia",
     # Dialogue and Instruction Tuning
-    "oasst1","super_natural_instructions","toolformer",
+    "oasst1",
+    "super_natural_instructions",
+    "toolformer",
     # Vision
-    "laion_aesthetic","coco_captions","vqa_v2","docvqa",
+    "laion_aesthetic",
+    "coco_captions",
+    "vqa_v2",
+    "docvqa",
     # Audio
-    "librispeech_asr","common_voice","audioset","audiocaps","speech_commands",
+    "librispeech_asr",
+    "common_voice",
+    "audioset",
+    "audiocaps",
+    "speech_commands",
     # Video
-    "webvid","msrvtt","tvqa","ego4d"
+    "webvid",
+    "msrvtt",
+    "tvqa",
+    "ego4d"
 ]
 
 #####################################
-# get_default_config()
+# get_default_config() 
 #####################################
 def get_default_config():
     return {
-        # ... all your hyperparams ...
-        "training_datasets": training_datasets,
-        "image_size": (64, 64),
+        "text_vocab_size": 10000,
+        "text_embed_dim": 512,
+        "text_encoder_layers": 2,
+        "text_decoder_layers": 2,
+        "text_num_heads": 8,
+        "text_ff_dim": 1024,
+        "text_max_len": 128,
+        "text_seq_len": 32,
+        "audio_latent_dim": 256,
+        "audio_output_length": 16000,
+        "image_latent_dim": 256,
+        "video_latent_dim": 256,
+        "video_num_frames": 16,
+        "video_frame_size": (64, 64),
+        "core_fused_dim": 512,
+        "external_fused_dim": 512,
+        "attention_num_heads": 8,
+        "attention_latent_dim": 128,
+        "cot_decoder_layers": 2,
+        "cot_max_len": 128,
+        "rag_documents": [
+            "Document 1: Advanced multimodal techniques.",
+            "Document 2: Chain-of-thought reasoning improves performance.",
+            "Document 3: Retrieval augmented generation in AI."
+        ],
+        "image_size": (64, 64),  # torchvision.transforms.Resize uses (H, W)
+        "training_datasets": training_datasets
     }
 
 #####################################
-# Helper: try_load_dataset with retries, auto‑config, throttling
+# Helper: Retry logic for loading datasets
 #####################################
-def try_load_dataset(name, split='train', max_retries=3, init_delay=5):
+def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
+    use_token = os.environ.get("HF_AUTH_TOKEN", None)
     delay = init_delay
-    token = os.environ.get("HF_AUTH_TOKEN", None)
     for attempt in range(max_retries):
         try:
-            return load_dataset(name, split=split, use_auth_token=token)
+            return load_dataset(name, split=split, use_auth_token=use_token)
         except Exception as e:
             err = str(e)
-            # rate‑limit
             if "429" in err:
-                print(f"[429] {name}#{split} attempt {attempt+1}/{max_retries}, retrying in {delay}s…")
+                print(f"Rate limited on {name}, retry {attempt+1}/{max_retries} in {delay}s...")
                 time.sleep(delay)
                 delay *= 2
-                continue
-            # pick first config if missing
-            if "Config name is missing" in err or "Please pick one among the available configs" in err:
+            elif "Config name is missing" in err:
                 try:
-                    builder = load_dataset_builder(name, use_auth_token=token)
-                    cfg = builder.info.config_name or builder.info.config_names[0]
-                    print(f"[AUTO‑CONFIG] using '{cfg}' for {name}#{split}")
-                    return load_dataset(name, cfg, split=split, use_auth_token=token)
-                except Exception as e2:
-                    print(f"[FAIL‑CFG] {name}#{split} → {e2}")
-                    break
-            # fallback to test split
-            if split=='train':
-                print(f"[FALLBACK] trying {name}#test due to {err}")
-                return try_load_dataset(name,'test',max_retries,init_delay)
-            # unrecoverable
-            raise
+                    builder = load_dataset_builder(name, use_auth_token=use_token)
+                    cfg_name = builder.info.config_names[0]
+                    print(f"Using config '{cfg_name}' for {name}.")
+                    return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
+                except Exception:
+                    print(f"Failed auto-config for {name}: {e}")
+            else:
+                print(f"Error loading {name}: {e}")
+    if split == 'train':
+        try:
+            return load_dataset(name, split='test', use_auth_token=use_token)
+        except Exception as e_test:
+            print(f"Failed fallback test split for {name}: {e_test}")
+    raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
 
 #####################################
-# MultiModalDataset (skips broken + logs)
+# MultiModalDataset
 #####################################
 class MultiModalDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_names, tokenizer, image_size=(64,64)):
+    def __init__(self, dataset_names, tokenizer, image_size=(64, 64)):
         self.tokenizer = tokenizer
-        self.transform = transforms.Compose([
+        self.image_transform = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor()
         ])
-        self.datasets, self.names = [], []
-        self.cumlen = []
+        self.datasets = []
+        self.names = []
+        self.cum_lengths = []
         total = 0
-
         for name in dataset_names:
-            print(f"[DOWNLOADING] {name}")
+            print(f"Downloading dataset: {name}")
             try:
                 ds = try_load_dataset(name, split='train')
-                length = len(ds)
-                total += length
+                length = len(ds) if hasattr(ds, "__len__") else 0
                 self.datasets.append(ds)
                 self.names.append(name)
-                self.cumlen.append(total)
-                print(f"[OK] {name} → {length} examples")
+                total += length
+                self.cum_lengths.append(total)
+                print(f"  → Loaded {length} examples.")
             except Exception as e:
-                print(f"[SKIP] {name} → {e}")
-
-        self.total = total
-
-        # emit a JSON report
-        info = {n: len(d) for n,d in zip(self.names,self.datasets)}
-        with open("dataset_infos.json","w") as f:
-            json.dump(info,f,indent=2)
+                print(f"  ✗ Skipping {name}: {e}")
+        self.total_length = total
+        info = {n: len(d) for n, d in zip(self.names, self.datasets)}
+        with open("dataset_infos.json", "w") as f:
+            json.dump(info, f, indent=2)
 
     def __len__(self):
-        return self.total
+        return self.total_length
 
-    def __getitem__(self, idx):
-        # locate which dataset
-        for i,cum in enumerate(self.cumlen):
-            if idx<cum:
-                prev = self.cumlen[i-1] if i>0 else 0
-                ex = self.datasets[i][idx-prev]
+    def __getitem__(self, index):
+        for idx, cum in enumerate(self.cum_lengths):
+            if index < cum:
+                prev = self.cum_lengths[idx-1] if idx > 0 else 0
+                example = self.datasets[idx][index - prev]
                 break
-        else:
-            ex = {}
-        # simple multimodal parsing...
         item = {}
-        text_fields = [v for k,v in ex.items() if isinstance(v,str)]
-        text = " ".join(text_fields)[:512]
-        item['input_ids'] = torch.tensor(self.tokenizer.tokenize(text))
-        item['labels']    = item['input_ids'].clone()
-        # images/audio/video can be added similarly
+        text_in, text_out = None, None
+        for k, v in example.items():
+            if isinstance(v, str):
+                if k.lower() in ["question", "prompt", "input", "query"]:
+                    text_in = (text_in or "") + v
+                elif k.lower() in ["answer", "response", "output", "reasoning", "multiple_choice_answer"]:
+                    text_out = (text_out or "") + v
+                else:
+                    text_in = (text_in or "") + v
+            elif k.lower() == "image" and v is not None:
+                item["image"] = self.image_transform(v if not isinstance(v, dict) else v.get("pil", v))
+            elif k.lower() == "audio" and v is not None:
+                arr = v.get("array", v)
+                item["audio"] = torch.tensor(arr, dtype=torch.float)
+            elif k.lower() == "video" and v is not None:
+                item["video"] = v
+        if text_in:
+            item["input_ids"] = torch.tensor(self.tokenizer.tokenize(text_in), dtype=torch.long)
+        if text_out:
+            item["labels"] = torch.tensor(self.tokenizer.tokenize(text_out), dtype=torch.long)
+        elif text_in:
+            item["labels"] = item["input_ids"].clone()
         return item
 
 #####################################
-# Collate
+# Collate Function
 #####################################
 def multimodal_collate(batch):
-    # pad input_ids & labels
-    max_len = max(x['input_ids'].size(0) for x in batch)
-    pad_id  = tokenizer.token_to_id["<PAD>"]
-    inputs  = []
-    labels  = []
-    for x in batch:
-        ids = x['input_ids']
-        pad = torch.full((max_len-ids.size(0),),pad_id,dtype=torch.long)
-        inputs.append(torch.cat([ids,pad]))
-        lbl = x['labels']
-        pad2 = torch.full((max_len-lbl.size(0),),pad_id,dtype=torch.long)
-        labels.append(torch.cat([lbl,pad2]))
-    return {
-        "input_ids": torch.stack(inputs),
-        "labels":    torch.stack(labels)
-    }
+    collated = {}
+    # text
+    if "input_ids" in batch[0]:
+        max_len = max(b["input_ids"].size(0) for b in batch)
+        pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
+        collated["input_ids"] = torch.stack([
+            torch.cat([b["input_ids"],
+                       pad[b["input_ids"].size(0):]]) for b in batch
+        ])
+    if "labels" in batch[0]:
+        max_len = max(b["labels"].size(0) for b in batch)
+        pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
+        collated["labels"] = torch.stack([
+            torch.cat([b["labels"],
+                       pad[b["labels"].size(0):]]) for b in batch
+        ])
+    # image
+    if "image" in batch[0]:
+        imgs = []
+        for b in batch:
+            if "image" in b:
+                imgs.append(b["image"])
+            else:
+                imgs.append(torch.zeros(3, *config["image_size"]))
+        collated["image"] = torch.stack(imgs)
+    # audio
+    if "audio" in batch[0]:
+        max_a = max(b["audio"].size(0) for b in batch if "audio" in b)
+        auds = []
+        for b in batch:
+            if "audio" in b:
+                a = b["audio"]
+                if a.size(0) < max_a:
+                    a = torch.cat([a, torch.zeros(max_a - a.size(0))], dim=0)
+            else:
+                a = torch.zeros(max_a)
+            auds.append(a)
+        collated["audio"] = torch.stack(auds)
+    # video left as list
+    if "video" in batch[0]:
+        collated["video"] = [b.get("video") for b in batch]
+    return collated
 
 #####################################
-# Training routine
+# Training Loop
 #####################################
-def train_model(model, dataloader, names, target_score, lr, device):
+def train_model(model, dataloader, dataset_names, target_score, lr, device):
     optimizer = Adam(model.parameters(), lr=lr)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    scaler    = GradScaler()
+    scaler = GradScaler()
     model.train()
 
-    scores = {n:0.0 for n in names}
-    overall = 0.0
-    epoch = 0
+    print("\n====== Model & Training Config ======")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {total_params:,}")
+    print("Datasets:")
+    for n in dataset_names:
+        print(" -", n)
+    print("=====================================\n")
 
-    print("=== MODEL & DATASETS ===")
-    print(f" Params: {sum(p.numel() for p in model.parameters()):,}")
-    for n in names: print(f"  - {n}")
-    print("=========================")
+    overall = 0.0
+    scores = {n:0.0 for n in dataset_names}
+    epoch = 0
 
     while overall < target_score:
         epoch += 1
-        total_loss = 0.0
-        cnt = 0
-        bar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        running_loss = 0.0
+        batches = 0
+        print(f"--- Epoch {epoch} ---")
+        bar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="batch")
         for batch in bar:
-            for k in batch: batch[k] = batch[k].to(device)
-            optimizer.zero_grad()
+            for k,v in batch.items():
+                if torch.is_tensor(v):
+                    batch[k] = v.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
             with autocast():
                 out = model(batch)
-                logits = out["text_out"]  # adjust to your model output
-                loss   = criterion(logits.view(-1,logits.size(-1)), batch["labels"].view(-1))
+                loss = 0.0
+                if "text_out" in out and "input_ids" in batch:
+                    logits = out["text_out"]
+                    loss += criterion(logits.view(-1, logits.size(-1)), batch["input_ids"].view(-1))
+                if "audio_out" in out and "audio" in batch:
+                    loss += torch.nn.MSELoss()(out["audio_out"], batch["audio"])
+                if "image_out" in out and "image" in batch:
+                    loss += torch.nn.MSELoss()(out["image_out"], batch["image"])
+                if "video_out" in out and "video" in batch:
+                    loss += torch.nn.MSELoss()(out["video_out"], batch["video"])
+                if "selfteach_loss" in out:
+                    loss += out["selfteach_loss"]
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
-            total_loss += loss.item()
-            cnt += 1
+            running_loss += loss.item()
+            batches += 1
             bar.set_postfix(loss=f"{loss.item():.4f}")
+        avg = running_loss / batches
+        for n in dataset_names:
+            scores[n] = max(0, 100 - avg*10)
+        overall = sum(scores.values()) / len(scores)
+        print(f"Epoch {epoch} | Avg Loss: {avg:.4f} | Overall Score: {overall:.2f}%\n")
+    torch.save(model.state_dict(), "unified_model.pt")
+    print("Training complete. Saved unified_model.pt")
 
-        avg = total_loss/cnt
-        overall = max(0,100 - avg*10)
-        print(f"Epoch {epoch} done — avg_loss {avg:.4f} — overall_score {overall:.2f}%")
-
-    torch.save(model.state_dict(),"unified_model.pt")
-    print("🚀 Training complete.")
-
+#####################################
+# Main Entry
+#####################################
 def main():
-    cfg = get_default_config()
-    toks = SimpleTokenizer(max_vocab_size=30000)
+    config = get_default_config()
+    # override training_datasets from top-level
+    config["training_datasets"] = training_datasets
 
-    # Build vocab from a small sample of each dataset
-    samples = []
-    for name in cfg["training_datasets"]:
+    global tokenizer
+    tokenizer = SimpleTokenizer(max_vocab_size=30000)
+
+    # Build vocab
+    sample_texts = []
+    for name in training_datasets:
         try:
-            ds = try_load_dataset(name, split='train', max_retries=1)
-            for i,ex in enumerate(ds):
-                for v in ex.values():
-                    if isinstance(v,str):
-                        samples.append(v)
-                if i>200: break
-        except Exception as e:
-            print(f"[VOCAB SKIP] {name} → {e}")
-    toks.fit_on_texts(samples)
+            stream = load_dataset(name, split='train', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
+        except:
+            try:
+                stream = load_dataset(name, split='test', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
+            except:
+                continue
+        for i, ex in enumerate(stream):
+            for v in ex.values():
+                if isinstance(v, str):
+                    sample_texts.append(v)
+            if i >= 500:
+                break
+    tokenizer.fit_on_texts(sample_texts)
 
-    # Build our multimodal dataset
-    ds = MultiModalDataset(cfg["training_datasets"], toks, image_size=cfg["image_size"])
-    loader = DataLoader(ds, batch_size=8, shuffle=True, collate_fn=multimodal_collate)
+    dataset = MultiModalDataset(training_datasets, tokenizer, image_size=config.get("image_size", (64,64)))
+    num_workers = os.cpu_count() or 4
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=num_workers,
+                            pin_memory=True, collate_fn=multimodal_collate)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type=="cuda":
-        torch.cuda.set_per_process_memory_fraction(0.95,0)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        torch.cuda.set_per_process_memory_fraction(0.95, 0)
+    else:
+        print("No GPU detected. Using CPU.")
 
-    model = UnifiedMultimodalModel(cfg).to(device)
-    train_model(model, loader, ds.names, target_score=95.0, lr=1e-4, device=device)
+    model = UnifiedMultimodalModel(config).to(device)
 
-if __name__=="__main__":
+    train_model(
+        model,
+        dataloader,
+        training_datasets,
+        target_score=100.0,
+        lr=1e-4,
+        device=device
+    )
+
+if __name__ == "__main__":
     main()
