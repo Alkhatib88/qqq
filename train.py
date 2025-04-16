@@ -12,6 +12,10 @@ Training script for the UnifiedMultimodalModel.
 - Configures GPU to use 95% of its memory.
 """
 
+HF_TOKEN = ""
+os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
+
+
 import os
 import time
 import threading
