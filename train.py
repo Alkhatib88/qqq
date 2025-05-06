@@ -4,7 +4,7 @@ train.py
 
 Training script for the UnifiedMultimodalModel with robust Hugging Face dataset loading:
   - Centralized HF authentication (via `huggingface-cli login` or HF_HUB_TOKEN)
-  - Interactive dataset selection (choose subset or all)
+  - Interactive dataset & split selection (choose subset or all, train/test/both)
   - Automatic config discovery for multi-config datasets
   - Rate-limit backoff, caching (cache_dir + DownloadMode), and streaming fallback
   - MultiModalDataset and collate function for unified text/image/audio/video loading
@@ -78,7 +78,7 @@ ALL_DATASETS = [
     "minchyeom/thinker-formatted",
     "fhai50032/GPQA-Thinking-O1",
     "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
-    # gated or extra (comment or uncomment as needed)
+    # gated or extra (toggle as desired)
     "matlok/multimodal-python-copilot-training-overview",
     "nvidia/Llama-Nemotron-Post-Training-Dataset",
     "wikimedia/wikipedia",
@@ -90,6 +90,39 @@ ALL_DATASETS = [
     "wikimedia/Encyclopedia_Britannica_1911",
     "opensource/Windows_Command_Line_Scripts",
 ]
+
+def get_default_config():
+    """Returns the model configuration dict."""
+    return {
+        "text_vocab_size": 10000,
+        "text_embed_dim": 512,
+        "text_encoder_layers": 2,
+        "text_decoder_layers": 2,
+        "text_num_heads": 8,
+        "text_ff_dim": 1024,
+        "text_max_len": 128,
+        "text_seq_len": 32,
+        "audio_latent_dim": 256,
+        "audio_output_length": 16000,
+        "image_latent_dim": 256,
+        "video_latent_dim": 256,
+        "video_num_frames": 16,
+        "video_frame_size": (64, 64),
+        "core_fused_dim": 512,
+        "external_fused_dim": 512,
+        "attention_num_heads": 8,
+        "attention_latent_dim": 128,
+        "cot_decoder_layers": 2,
+        "cot_max_len": 128,
+        "rag_documents": [
+            "Document 1: Advanced multimodal techniques.",
+            "Document 2: Chain-of-thought reasoning improves performance.",
+            "Document 3: Retrieval augmented generation in AI."
+        ],
+        "image_size": (64, 64),
+        # will be overwritten in main()
+        "training_datasets": []
+    }
 
 def choose_datasets():
     """Prompt the user to pick a subset of ALL_DATASETS (or all)."""
@@ -149,7 +182,7 @@ def try_load_dataset(name, split="train", max_retries=3, init_delay=10):
                 delay *= 2
                 continue
             if "Config name is missing" in msg or "missing" in msg:
-                # try without config
+                # retry without explicit config
                 try:
                     return load_dataset(
                         name, split=split,
@@ -162,7 +195,7 @@ def try_load_dataset(name, split="train", max_retries=3, init_delay=10):
             print(f"Error loading {name}: {e}")
             break
 
-    # final fallback: streaming mode
+    # final fallback: streaming
     print(f"Falling back to streaming for {name}")
     return load_dataset(
         name, split=split,
@@ -241,7 +274,6 @@ class MultiModalDataset(torch.utils.data.Dataset):
             item["input_ids"] = torch.tensor(
                 self.tokenizer.tokenize(tin), dtype=torch.long
             )
-
         if tout:
             item["labels"] = torch.tensor(
                 self.tokenizer.tokenize(tout), dtype=torch.long
@@ -263,7 +295,6 @@ def multimodal_collate(batch):
             torch.cat([b["input_ids"], pad[b["input_ids"].size(0):]])
             for b in batch
         ])
-
     if "labels" in batch[0]:
         maxlen = max(b["labels"].size(0) for b in batch)
         pad = batch[0]["labels"].new_full((maxlen,), fill_value=-100)
@@ -311,7 +342,6 @@ def train_model(model, dataloader, dataset_names, target_score, lr, device):
 
     overall = 0.0
     epoch = 0
-
     while overall < target_score:
         epoch += 1
         total_loss = 0.0
@@ -368,14 +398,24 @@ def train_model(model, dataloader, dataset_names, target_score, lr, device):
     print("Training complete. Model saved to unified_model.pt")
 
 def main():
-    # let user choose which datasets to train on
+    # 1) Choose your datasets
     training_datasets = choose_datasets()
 
-    # build config
-    config = get_default_config()
-    config["training_datasets"] = training_datasets
+    # 2) Ask which split(s)
+    split_choice = input("Which split(s)? (train/test/both) [both]: ").strip().lower() or "both"
+    if split_choice == "train":
+        entries = training_datasets
+    elif split_choice == "test":
+        entries = [f"{n}" + "" for n in training_datasets]  # same list, but will pass split="test" below
+    else:
+        # both: we'll load train then test in MultiModalDataset
+        entries = training_datasets + training_datasets
 
-    # build tokenizer via small streaming sample
+    # 3) Build config
+    config = get_default_config()
+    config["training_datasets"] = training_datasets  # names only; splits handled internally
+
+    # 4) Build tokenizer via small streaming sample
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
     samples = []
     for name in training_datasets:
@@ -391,7 +431,7 @@ def main():
             continue
     tokenizer.fit_on_texts(samples)
 
-    # prepare dataset + dataloader
+    # 5) Prepare dataset & dataloader
     dataset = MultiModalDataset(training_datasets, tokenizer,
                                 image_size=config.get("image_size", (64,64)))
     dataloader = DataLoader(
@@ -400,12 +440,12 @@ def main():
         pin_memory=True, collate_fn=multimodal_collate
     )
 
-    # device setup
+    # 6) Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.95, 0)
 
-    # model & train
+    # 7) Instantiate & train
     model = UnifiedMultimodalModel(config).to(device)
     train_model(model, dataloader, training_datasets,
                 target_score=100.0, lr=1e-4, device=device)
