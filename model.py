@@ -185,7 +185,7 @@ class MultiHeadLatentAttentionCustom(nn.Module):
 #####################################
 class ChainOfThoughtGeneratorAdvanced(nn.Module):
     def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim,
-                 max_len=256, num_samples=5):
+            max_len=128000, num_samples=5):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         layer = nn.TransformerDecoderLayer(
