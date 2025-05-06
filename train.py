@@ -372,7 +372,7 @@ def main():
     training_datasets = choose_datasets()
 
     # build config
-    config = UnifiedMultimodalModel.get_default_config()
+    config = get_default_config()
     config["training_datasets"] = training_datasets
 
     # build tokenizer via small streaming sample
