@@ -1,3 +1,5 @@
+# model.py
+
 #!/usr/bin/env python3
 """
 model.py
@@ -70,19 +72,19 @@ class TitansMemoryMAC(nn.Module):
     def __init__(self, memory_size, embedding_dim, num_heads=4):
         super(TitansMemoryMAC, self).__init__()
         self.memory = nn.Parameter(torch.randn(memory_size, embedding_dim))
-        self.attn = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(embed_dim=embedding_dim,
+                                          num_heads=num_heads,
+                                          batch_first=True)
         self.gate_fc = nn.Linear(embedding_dim * 2, embedding_dim)
     def forward(self, x):
         query = x.unsqueeze(1)  # (batch, 1, embedding_dim)
-        key = self.memory.unsqueeze(0).expand(x.size(0), -1, -1)  # (batch, memory_size, embedding_dim)
+        key = self.memory.unsqueeze(0).expand(x.size(0), -1, -1)
         value = key
-        attn_output, _ = self.attn(query, key, value)  # (batch, 1, embedding_dim)
-        attn_output = attn_output.squeeze(1)  # (batch, embedding_dim)
-        # Concatenate input and memory output then compute gate
-        concat = torch.cat([x, attn_output], dim=1)  # (batch, 2*embedding_dim)
-        gate = torch.sigmoid(self.gate_fc(concat))  # (batch, embedding_dim)
-        gated_output = gate * attn_output
-        return gated_output
+        attn_output, _ = self.attn(query, key, value)
+        attn_output = attn_output.squeeze(1)
+        concat = torch.cat([x, attn_output], dim=1)
+        gate = torch.sigmoid(self.gate_fc(concat))
+        return gate * attn_output
 
 #####################################
 # SelfTeach Module for Reinforcement Learning of Reasoning
@@ -90,12 +92,9 @@ class TitansMemoryMAC(nn.Module):
 class SelfTeachModule(nn.Module):
     def __init__(self, embed_dim):
         super(SelfTeachModule, self).__init__()
-        # Critic network to predict a reward from a chain-of-thought embedding
         self.critic = nn.Linear(embed_dim, 1)
     def forward(self, cot_embedding):
-        # Returns a scalar reward per example
-        reward = self.critic(cot_embedding)
-        return reward
+        return self.critic(cot_embedding)
 
 #####################################
 # Custom Multi-Head Latent Attention (from scratch)
@@ -111,42 +110,30 @@ class MultiHeadLatentAttentionCustom(nn.Module):
         self.W_q = nn.Linear(embed_dim, embed_dim)
         self.W_k = nn.Linear(embed_dim, embed_dim)
         self.W_v = nn.Linear(embed_dim, embed_dim)
-        # Up-projection for latent representation (to compress K, V)
         self.latent_proj = nn.Linear(embed_dim, latent_dim)
         self.out_proj = nn.Linear(latent_dim, embed_dim)
+
     def forward(self, x):
-        # x: (batch, seq_len, embed_dim)
-        Q = self.W_q(x)
-        K = self.W_k(x)
-        V = self.W_v(x)
-        # Project K into latent space
-        K_latent = self.latent_proj(K)
-        V_latent = self.latent_proj(V)
-        # Reshape for multi-head: (batch, num_heads, seq_len, head_dim) for Q
-        B, T, _ = Q.size()
-        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1,2)
-        # For latent K and V: (batch, num_heads, seq_len, latent_dim // num_heads)
-        latent_head_dim = self.latent_dim // self.num_heads
-        K_latent = K_latent.view(B, T, self.num_heads, latent_head_dim).transpose(1,2)
-        V_latent = V_latent.view(B, T, self.num_heads, latent_head_dim).transpose(1,2)
-        # Compute attention scores
-        scores = torch.matmul(Q, K_latent.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        B, T, _ = x.size()
+        Q = self.W_q(x).view(B, T, self.num_heads, self.head_dim).transpose(1,2)
+        K = self.latent_proj(self.W_k(x)).view(B, T, self.num_heads, self.latent_dim//self.num_heads).transpose(1,2)
+        V = self.latent_proj(self.W_v(x)).view(B, T, self.num_heads, self.latent_dim//self.num_heads).transpose(1,2)
+        scores = torch.matmul(Q, K.transpose(-2,-1)) / math.sqrt(self.head_dim)
         attn = torch.softmax(scores, dim=-1)
-        output = torch.matmul(attn, V_latent)
-        # Concatenate heads
-        output = output.transpose(1,2).contiguous().view(B, T, self.latent_dim)
-        # Project back to embed_dim
-        output = self.out_proj(output)
-        return output
+        out = torch.matmul(attn, V).transpose(1,2).contiguous().view(B, T, self.latent_dim)
+        return self.out_proj(out)
 
 #####################################
-# Advanced Chain-of-Thought Generator (with multiple sampling from scratch)
+# Advanced Chain-of-Thought Generator
 #####################################
 class ChainOfThoughtGeneratorAdvanced(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim, max_len=256, num_samples=5):
+    def __init__(self, vocab_size, embed_dim, num_layers, num_heads, ff_dim,
+                 max_len=256, num_samples=5):
         super(ChainOfThoughtGeneratorAdvanced, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=ff_dim, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(embed_dim, vocab_size)
         self.max_len = max_len
@@ -156,41 +143,27 @@ class ChainOfThoughtGeneratorAdvanced(nn.Module):
         x = self.embed(tgt_ids)
         x = apply_rotary_positional_encoding(x)
         out = self.decoder(x, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-        logits = self.fc_out(out)
-        return logits
+        return self.fc_out(out)
 
     def generate_multiple(self, prompt_ids):
-        # Generate multiple chain-of-thought outputs using sampling
         B, L = prompt_ids.size()
-        all_generated = []
-        all_log_probs = []
-        for sample in range(self.num_samples):
-            generated = prompt_ids.clone()
-            log_prob_sum = torch.zeros(B, 1, device=prompt_ids.device)
-            memory = apply_rotary_positional_encoding(self.embed(prompt_ids))
+        all_gen, all_logp = [], []
+        for _ in range(self.num_samples):
+            gen = prompt_ids.clone()
+            logp = torch.zeros(B,1, device=prompt_ids.device)
+            mem = apply_rotary_positional_encoding(self.embed(prompt_ids))
             for _ in range(self.max_len - L):
-                logits = self.forward(generated, memory)
-                # Get the probabilities for the last token
+                logits = self.forward(gen, mem)
                 probs = torch.softmax(logits[:, -1, :], dim=-1)
-                # Sample next token
-                next_token = torch.multinomial(probs, num_samples=1)
-                # Gather log probability
-                log_probs = torch.log(torch.gather(probs, 1, next_token) + 1e-8)
-                log_prob_sum += log_probs
-                generated = torch.cat([generated, next_token], dim=1)
-                # Stop if EOS token (assume token id 0 is EOS)
-                if (next_token == 0).all():
-                    break
-            all_generated.append(generated)
-            all_log_probs.append(log_prob_sum)
-        # Stack outputs: shape (num_samples, batch, seq_len), (num_samples, batch, 1)
-        all_generated = torch.stack(all_generated, dim=0)
-        all_log_probs = torch.stack(all_log_probs, dim=0)
-        return all_generated, all_log_probs
+                nxt = torch.multinomial(probs, 1)
+                logp += torch.log(probs.gather(1, nxt) + 1e-8)
+                gen = torch.cat([gen, nxt], dim=1)
+                if (nxt==0).all(): break
+            all_gen.append(gen); all_logp.append(logp)
+        return torch.stack(all_gen), torch.stack(all_logp)
 
     def generate_with_prompt(self, prompt_ids):
-        generated, log_probs = self.generate_multiple(prompt_ids)
-        return generated, log_probs
+        return self.generate_multiple(prompt_ids)
 
 #####################################
 # Standard Image, Audio, Video Encoder/Decoder Modules (as before)

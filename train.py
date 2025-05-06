@@ -2,42 +2,44 @@
 """
 train.py
 
-Training script for the UnifiedMultimodalModel.
-- Downloads real datasets from Hugging Face based on an extended comprehensive training_datasets list.
-- Builds a custom tokenizer (from tokenizer.py) using sample texts.
-- Loads and preprocesses the data via a unified MultiModalDataset.
-- Trains the model with advanced techniques (SelfTeach loss, TitansMemoryMAC with gating, advanced chain-of-thought generation,
-  custom multi-head latent attention, Deepseeks Reasoning, etc.) until a target performance is reached.
-- Displays extensive information on model configuration, dataset status, model parameters, and training progress.
-- Configures GPU to use 95% of its memory.
+Training script for the UnifiedMultimodalModel with robust Hugging Face dataset loading:
+  - Centralized HF authentication (via `huggingface-cli login` or HF_HUB_TOKEN)
+  - Interactive dataset selection (choose subset or all)
+  - Automatic config discovery for multi-config datasets
+  - Rate-limit backoff, caching (cache_dir + DownloadMode), and streaming fallback
+  - MultiModalDataset and collate function for unified text/image/audio/video loading
+  - Advanced training loop with mixed precision, gradient scaling, and SelfTeach loss
 """
 
 import os
 import time
 import json
+import random
+
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from datasets import load_dataset, load_dataset_builder
 from torchvision import transforms
+
+from datasets import load_dataset, get_dataset_config_names, DownloadMode
+from huggingface_hub import HfFolder
 
 from model import UnifiedMultimodalModel
 from tokenizer import SimpleTokenizer
 
-#####################################
-# Hugging Face Authentication Token
-#####################################
-HF_TOKEN = ""
-os.environ["HF_AUTH_TOKEN"] = HF_TOKEN
+# === Constants & Environment Setup ===
+CACHE_DIR = os.environ.get(
+    "HF_HOME",
+    os.path.expanduser("~/.cache/huggingface/datasets")
+)
+HF_HUB_TOKEN = HfFolder.get_token() or os.environ.get("HF_HUB_TOKEN")
+assert HF_HUB_TOKEN, \
+       "Please login via `huggingface-cli login` or set the HF_HUB_TOKEN env var."
 
-#####################################
-# Extended Training Datasets List
-# Include a guaranteed fallback dataset to ensure at least one loads
-#####################################
-training_datasets = [
-    "ag_news",  # fallback dataset that always exists
+# === All Available Datasets ===
+ALL_DATASETS = [
     # core Python reasoning/code corpora
     "Multimodal-Fatima/VQAv2_sample_train",
     "Multimodal-Fatima/OxfordFlowers_test",
@@ -76,310 +78,337 @@ training_datasets = [
     "minchyeom/thinker-formatted",
     "fhai50032/GPQA-Thinking-O1",
     "ThinkAgents/Function-Calling-with-Chain-of-Thoughts",
+    # gated or extra (comment or uncomment as needed)
+    "matlok/multimodal-python-copilot-training-overview",
+    "nvidia/Llama-Nemotron-Post-Training-Dataset",
+    "wikimedia/wikipedia",
+    "unrealengine/UnrealEngineDocumentation",
+    "epicgames/UE5_Blueprint",
+    "voxelplugin/UE_Voxel_Plugin_Samples",
+    "blender/BlenderPythonAPI",
+    "scriptingtools/SublimeTextConfigs",
+    "wikimedia/Encyclopedia_Britannica_1911",
+    "opensource/Windows_Command_Line_Scripts",
 ]
 
-#####################################
-# Helper: Retry logic for loading datasets
-#####################################
-def try_load_dataset(name, split='train', max_retries=3, init_delay=10):
-    """Attempt to load a dataset with retries and config fallback."""
-    use_token = os.environ.get("HF_AUTH_TOKEN")
+def choose_datasets():
+    """Prompt the user to pick a subset of ALL_DATASETS (or all)."""
+    print("\nAvailable training datasets:")
+    for i, name in enumerate(ALL_DATASETS, start=1):
+        print(f"  {i:3d}. {name}")
+    print("  all  → select every dataset above")
+
+    choice = input("\nEnter indices (e.g. 1,4,7) or `all` [default=all]: ").strip()
+    if not choice or choice.lower() == "all":
+        return ALL_DATASETS
+
+    selected = []
+    for token in choice.split(","):
+        token = token.strip()
+        if token.isdigit():
+            idx = int(token) - 1
+            if 0 <= idx < len(ALL_DATASETS):
+                selected.append(ALL_DATASETS[idx])
+    if not selected:
+        print("No valid selection detected; defaulting to all datasets.\n")
+        return ALL_DATASETS
+    return selected
+
+def try_load_dataset(name, split="train", max_retries=3, init_delay=10):
+    """
+    Load a dataset with:
+      - config discovery via get_dataset_config_names()
+      - local caching (CACHE_DIR)
+      - rate-limit backoff
+      - streaming fallback
+    """
     delay = init_delay
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
-            return load_dataset(name, split=split, use_auth_token=use_token)
+            configs = get_dataset_config_names(name)
+            if configs:
+                cfg = configs[0]
+                return load_dataset(
+                    name, cfg, split=split,
+                    cache_dir=CACHE_DIR,
+                    download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    token=HF_HUB_TOKEN
+                )
+            else:
+                return load_dataset(
+                    name, split=split,
+                    cache_dir=CACHE_DIR,
+                    download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    token=HF_HUB_TOKEN
+                )
         except Exception as e:
-            err = str(e)
-            # Retry without auth token if builder rejects it
-            if "unexpected keyword argument 'use_auth_token'" in err:
-                return load_dataset(name, split=split)
-            # Handle missing cache/config errors by picking first available config
-            if "Couldn't find cache for" in err and "Available configs" in err:
-                builder = load_dataset_builder(name, use_auth_token=use_token)
-                cfg_name = builder.info.config_names[0]
-                print(f"Using config '{cfg_name}' for {name}.")
-                return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
-            # HTTP 429 rate limit
-            if "429" in err:
-                print(f"Rate limited on {name}, retry {attempt+1}/{max_retries} in {delay}s...")
+            msg = str(e)
+            if "429" in msg:
+                print(f"Rate limited on {name} (attempt {attempt}/{max_retries}), sleeping {delay}s…")
                 time.sleep(delay)
                 delay *= 2
-            # Try alternative config names
-            elif "Config name is missing" in err:
+                continue
+            if "Config name is missing" in msg or "missing" in msg:
+                # try without config
                 try:
-                    builder = load_dataset_builder(name, use_auth_token=use_token)
-                    cfg_name = builder.info.config_names[0]
-                    print(f"Using config '{cfg_name}' for {name}.")
-                    return load_dataset(name, cfg_name, split=split, use_auth_token=use_token)
-                except Exception:
-                    print(f"Failed auto-config for {name}: {e}")
-            else:
-                print(f"Error loading {name}: {e}")
-    # Fallback to 'test' split if 'train' fails
-    if split == 'train':
-        try:
-            return load_dataset(name, split='test', use_auth_token=use_token)
-        except Exception as e_test:
-            print(f"Failed fallback test split for {name}: {e_test}")
-    raise RuntimeError(f"Could not load {name} after {max_retries} attempts.")
+                    return load_dataset(
+                        name, split=split,
+                        cache_dir=CACHE_DIR,
+                        download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
+                        token=HF_HUB_TOKEN
+                    )
+                except:
+                    pass
+            print(f"Error loading {name}: {e}")
+            break
 
-#####################################
-# MultiModalDataset
-#####################################
+    # final fallback: streaming mode
+    print(f"Falling back to streaming for {name}")
+    return load_dataset(
+        name, split=split,
+        streaming=True,
+        token=HF_HUB_TOKEN
+    )
+
 class MultiModalDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_names, tokenizer, image_size=(64, 64)):
+    """Wraps multiple HF datasets into one unified torch Dataset."""
+    def __init__(self, dataset_names, tokenizer, image_size=(64,64)):
         self.tokenizer = tokenizer
-        self.image_transform = transforms.Compose([
+        self.image_tf = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor()
         ])
+
         self.datasets = []
         self.names = []
-        self.cum_lengths = []
+        self.cumlen = []
         total = 0
+
         for name in dataset_names:
-            print(f"Downloading dataset: {name}")
+            print(f"Loading dataset {name}…")
             try:
-                ds = try_load_dataset(name, split='train')
-                length = len(ds) if hasattr(ds, '__len__') else 0
-                if length > 0:
-                    print(f"  ✔ {name}: {length} examples")
-                    self.datasets.append(ds)
-                    self.names.append(name)
-                    total += length
-                    self.cum_lengths.append(total)
-                else:
-                    print(f"  ✗ {name} has zero examples, skipping.")
+                ds = try_load_dataset(name, split="train")
+                n = len(ds) if hasattr(ds, "__len__") else 0
+                self.datasets.append(ds)
+                self.names.append(name)
+                total += n
+                self.cumlen.append(total)
+                print(f"  → {n} examples")
             except Exception as e:
-                print(f"  ✗ {name}: {e}")
+                print(f"  ✗ Skipping {name}: {e}")
+
         self.total_length = total
-        if not self.datasets:
-            # Final fallback: load a small portion of the fallback dataset streaming
-            fb = training_datasets[0]
-            print(f"No datasets loaded; falling back to streaming '{fb}' for 1000 examples.")
-            stream = load_dataset(fb, split='train', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
-            samples = []
-            for i, ex in enumerate(stream):
-                samples.append(ex)
-                if i >= 999:
-                    break
-            self.datasets = [samples]
-            self.names = [fb + "_stream"]
-            self.cum_lengths = [len(samples)]
-            self.total_length = len(samples)
-        info = {n: len(d) for n, d in zip(self.names, self.datasets)}
         with open("dataset_infos.json", "w") as f:
+            info = {n: len(d) for n,d in zip(self.names, self.datasets)}
             json.dump(info, f, indent=2)
 
     def __len__(self):
         return self.total_length
 
-    def __getitem__(self, index):
-        for idx, cum in enumerate(self.cum_lengths):
-            if index < cum:
-                prev = self.cum_lengths[idx-1] if idx > 0 else 0
-                example = self.datasets[idx][index - prev]
+    def __getitem__(self, idx):
+        # find which sub‐dataset
+        for i, cum in enumerate(self.cumlen):
+            if idx < cum:
+                prev = self.cumlen[i-1] if i>0 else 0
+                ex = self.datasets[i][idx - prev]
                 break
+
         item = {}
-        text_in, text_out = None, None
-        for k, v in example.items():
+        tin = tout = None
+
+        for k,v in ex.items():
+            kl = k.lower()
             if isinstance(v, str):
-                if k.lower() in ["question", "prompt", "input", "query"]:
-                    text_in = (text_in or "") + v
-                elif k.lower() in ["answer", "response", "output"]:
-                    text_out = (text_out or "") + v
+                if kl in ("question","prompt","input","query"):
+                    tin = (tin or "") + v
+                elif kl in ("answer","output","reasoning","response"):
+                    tout = (tout or "") + v
                 else:
-                    text_in = (text_in or "") + v
-            elif k.lower() == "text":
-                text_in = (text_in or "") + v
-            elif k.lower() == "image" and v is not None:
-                item["image"] = self.image_transform(v if not isinstance(v, dict) else v.get("pil", v))
-            elif k.lower() == "audio" and v is not None:
+                    tin = (tin or "") + v
+
+            elif kl == "image" and v is not None:
+                img = v if not isinstance(v, dict) else v.get("pil", v)
+                item["image"] = self.image_tf(img)
+
+            elif kl == "audio" and v is not None:
                 arr = v.get("array", v)
                 item["audio"] = torch.tensor(arr, dtype=torch.float)
-            elif k.lower() == "video" and v is not None:
+
+            elif kl == "video" and v is not None:
                 item["video"] = v
-        if text_in:
-            item["input_ids"] = torch.tensor(self.tokenizer.tokenize(text_in), dtype=torch.long)
-        if text_out:
-            item["labels"] = torch.tensor(self.tokenizer.tokenize(text_out), dtype=torch.long)
-        elif text_in:
+
+        if tin:
+            item["input_ids"] = torch.tensor(
+                self.tokenizer.tokenize(tin), dtype=torch.long
+            )
+
+        if tout:
+            item["labels"] = torch.tensor(
+                self.tokenizer.tokenize(tout), dtype=torch.long
+            )
+        elif tin:
             item["labels"] = item["input_ids"].clone()
+
         return item
 
-#####################################
-# Collate Function
-#####################################
 def multimodal_collate(batch):
+    """Pad & stack text, image, audio, and leave video as list."""
     collated = {}
+
+    # text in / labels
     if "input_ids" in batch[0]:
-        max_len = max(b["input_ids"].size(0) for b in batch)
-        pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
+        maxlen = max(b["input_ids"].size(0) for b in batch)
+        pad = batch[0]["input_ids"].new_full((maxlen,), fill_value=0)  # <PAD>=0
         collated["input_ids"] = torch.stack([
-            torch.cat([b["input_ids"], pad[b["input_ids"].size(0):]]) for b in batch
+            torch.cat([b["input_ids"], pad[b["input_ids"].size(0):]])
+            for b in batch
         ])
+
     if "labels" in batch[0]:
-        max_len = max(b["labels"].size(0) for b in batch)
-        pad = torch.full((max_len,), tokenizer.token_to_id["<PAD>"], dtype=torch.long)
+        maxlen = max(b["labels"].size(0) for b in batch)
+        pad = batch[0]["labels"].new_full((maxlen,), fill_value=-100)
         collated["labels"] = torch.stack([
-            torch.cat([b["labels"], pad[b["labels"].size(0):]]) for b in batch
+            torch.cat([b["labels"], pad[b["labels"].size(0):]])
+            for b in batch
         ])
+
+    # images
     if "image" in batch[0]:
-        imgs = [b.get("image", torch.zeros(3, *config["image_size"])) for b in batch]
-        collated["image"] = torch.stack(imgs)
+        collated["image"] = torch.stack([
+            b.get("image", torch.zeros_like(batch[0]["image"]))
+            for b in batch
+        ])
+
+    # audio
     if "audio" in batch[0]:
-        max_a = max(b["audio"].size(0) for b in batch if "audio" in b)
+        max_a = max(b["audio"].size(0) for b in batch)
         auds = []
         for b in batch:
-            if "audio" in b:
-                a = b["audio"]
-                if a.size(0) < max_a:
-                    a = torch.cat([a, torch.zeros(max_a - a.size(0))], dim=0)
-            else:
-                a = torch.zeros(max_a)
+            a = b.get("audio", torch.zeros(max_a))
+            if a.size(0) < max_a:
+                a = torch.cat([a, torch.zeros(max_a - a.size(0))], dim=0)
             auds.append(a)
         collated["audio"] = torch.stack(auds)
+
+    # video
     if "video" in batch[0]:
         collated["video"] = [b.get("video") for b in batch]
+
     return collated
 
-#####################################
-# Training Loop
-#####################################
 def train_model(model, dataloader, dataset_names, target_score, lr, device):
     optimizer = Adam(model.parameters(), lr=lr)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
     scaler = GradScaler()
     model.train()
 
-    print("\n====== Model & Training Config ======")
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,}")
+    print("\n=== TRAINING CONFIG ===")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print("Datasets:")
     for n in dataset_names:
-        print(" -", n)
-    print("=====================================\n")
+        print("  -", n)
+    print("=======================\n")
 
     overall = 0.0
-    scores = {n:0.0 for n in dataset_names}
     epoch = 0
 
     while overall < target_score:
         epoch += 1
-        running_loss = 0.0
+        total_loss = 0.0
         batches = 0
         print(f"--- Epoch {epoch} ---")
-        bar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="batch")
-        for batch in bar:
-            for k, v in batch.items():
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch}"):
+            # move to device
+            for k,v in batch.items():
                 if torch.is_tensor(v):
                     batch[k] = v.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+
+            optimizer.zero_grad()
             with autocast():
                 out = model(batch)
-                loss = torch.tensor(0.0, device=device)
+                loss = 0.0
+                # text
                 if "text_out" in out and "input_ids" in batch:
                     logits = out["text_out"]
-                    loss += criterion(logits.view(-1, logits.size(-1)), batch["input_ids"].view(-1))
+                    loss += criterion(
+                        logits.view(-1, logits.size(-1)),
+                        batch["input_ids"].view(-1)
+                    )
+                # audio
                 if "audio_out" in out and "audio" in batch:
-                    loss += torch.nn.MSELoss()(out["audio_out"], batch["audio"])
+                    loss += torch.nn.MSELoss()(
+                        out["audio_out"], batch["audio"]
+                    )
+                # image
                 if "image_out" in out and "image" in batch:
-                    loss += torch.nn.MSELoss()(out["image_out"], batch["image"])
+                    loss += torch.nn.MSELoss()(
+                        out["image_out"], batch["image"]
+                    )
+                # video
                 if "video_out" in out and "video" in batch:
-                    loss += torch.nn.MSELoss()(out["video_out"], batch["video"])
+                    loss += torch.nn.MSELoss()(
+                        out["video_out"], batch["video"]
+                    )
+                # self-teach
                 if "selfteach_loss" in out:
                     loss += out["selfteach_loss"]
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            running_loss += loss.item()
+
+            total_loss += loss.item()
             batches += 1
-            bar.set_postfix(loss=f"{loss.item():.4f}")
-        avg = running_loss / batches
-        for n in dataset_names:
-            scores[n] = max(0, 100 - avg*10)
-        overall = sum(scores.values()) / len(scores)
-        print(f"Epoch {epoch} | Avg Loss: {avg:.4f} | Overall Score: {overall:.2f}%\n")
+
+        avg = total_loss / batches
+        overall = max(0, 100 - avg * 10)
+        print(f"Epoch {epoch} | Avg Loss: {avg:.4f} | Score: {overall:.2f}%\n")
+
     torch.save(model.state_dict(), "unified_model.pt")
-    print("Training complete. Saved unified_model.pt")
+    print("Training complete. Model saved to unified_model.pt")
 
-#####################################
-# Main Entry
-#####################################
 def main():
-    config = {
-        "text_vocab_size": 10000,
-        "text_embed_dim": 512,
-        "text_encoder_layers": 2,
-        "text_decoder_layers": 2,
-        "text_num_heads": 8,
-        "text_ff_dim": 1024,
-        "text_max_len": 128,
-        "text_seq_len": 32,
-        "audio_latent_dim": 256,
-        "audio_output_length": 16000,
-        "image_latent_dim": 256,
-        "video_latent_dim": 256,
-        "video_num_frames": 16,
-        "video_frame_size": (64, 64),
-        "core_fused_dim": 512,
-        "external_fused_dim": 512,
-        "attention_num_heads": 8,
-        "attention_latent_dim": 128,
-        "cot_decoder_layers": 2,
-        "cot_max_len": 128,
-        "rag_documents": [
-            "Document 1: Advanced multimodal techniques.",
-            "Document 2: Chain-of-thought reasoning improves performance.",
-            "Document 3: Retrieval augmented generation in AI."
-        ],
-        "image_size": (64, 64),
-        "training_datasets": training_datasets
-    }
+    # let user choose which datasets to train on
+    training_datasets = choose_datasets()
 
-    global tokenizer
+    # build config
+    config = UnifiedMultimodalModel.get_default_config()
+    config["training_datasets"] = training_datasets
+
+    # build tokenizer via small streaming sample
     tokenizer = SimpleTokenizer(max_vocab_size=30000)
-
-    # Build vocab via streaming samples
-    sample_texts = []
+    samples = []
     for name in training_datasets:
         try:
-            stream = load_dataset(name, split='train', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
+            stream = try_load_dataset(name, split="train")
+            for i, ex in enumerate(stream):
+                for v in ex.values():
+                    if isinstance(v, str):
+                        samples.append(v)
+                if i >= 100:
+                    break
         except:
-            try:
-                stream = load_dataset(name, split='test', streaming=True, use_auth_token=os.environ.get("HF_AUTH_TOKEN"))
-            except:
-                continue
-        for i, ex in enumerate(stream):
-            for v in ex.values():
-                if isinstance(v, str):
-                    sample_texts.append(v)
-            if i >= 500:
-                break
-    tokenizer.fit_on_texts(sample_texts)
+            continue
+    tokenizer.fit_on_texts(samples)
 
-    dataset = MultiModalDataset(training_datasets, tokenizer, image_size=config.get("image_size", (64,64)))
-    num_workers = os.cpu_count() or 4
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=num_workers,
-                            pin_memory=True, collate_fn=multimodal_collate)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        torch.cuda.set_per_process_memory_fraction(0.95, 0)
-    else:
-        print("No GPU detected. Using CPU.")
-
-    model = UnifiedMultimodalModel(config).to(device)
-
-    train_model(
-        model,
-        dataloader,
-        training_datasets,
-        target_score=100.0,
-        lr=1e-4,
-        device=device
+    # prepare dataset + dataloader
+    dataset = MultiModalDataset(training_datasets, tokenizer,
+                                image_size=config.get("image_size", (64,64)))
+    dataloader = DataLoader(
+        dataset, batch_size=2, shuffle=True,
+        num_workers=os.cpu_count() or 4,
+        pin_memory=True, collate_fn=multimodal_collate
     )
+
+    # device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.95, 0)
+
+    # model & train
+    model = UnifiedMultimodalModel(config).to(device)
+    train_model(model, dataloader, training_datasets,
+                target_score=100.0, lr=1e-4, device=device)
 
 if __name__ == "__main__":
     main()
