@@ -1,75 +1,76 @@
-# test.py
-
 #!/usr/bin/env python3
 """
 test.py
 
-Interactive loop for UnifiedMultimodalModel.  
-Supports simple function‐call commands.
+Interactive test script for the UnifiedMultimodalModel.
+Loads the trained model and tokenizer, then enters an interactive chat loop.
+Commands for function calls (e.g. build_script, execute_script) are supported.
+Type 'bye' to exit.
 """
 
 import torch
 from model import UnifiedMultimodalModel
 from tokenizer import SimpleTokenizer
+from train import get_default_config
 
-def get_default_config():
-    # must match train.py’s config
-    return {
-      "text_vocab_size":10000,"text_embed_dim":512,
-      "text_encoder_layers":2,"text_decoder_layers":2,
-      "text_num_heads":8,"text_ff_dim":1024,"text_max_len":128,
-      "cot_decoder_layers":2,"cot_max_len":128,
-      "audio_latent_dim":256,"audio_output_length":16000,
-      "image_latent_dim":256,"video_latent_dim":256,
-      "video_num_frames":16,"video_frame_size":(64,64),
-      "core_fused_dim":512,"external_fused_dim":512,
-      "attention_num_heads":8,
-      "rag_documents":["Document 1","Document 2","Document 3"]
-    }
-
-def load_model(cfg, path="unified_model.pt"):
-    model = UnifiedMultimodalModel(cfg)
-    dev   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def load_model(config, model_path="unified_model.pt"):
+    model = UnifiedMultimodalModel(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        st = torch.load(path, map_location=dev)
-        model.load_state_dict(st)
-        print(f"Loaded weights from {path}")
+        state = torch.load(model_path, map_location=device)
+        model.load_state_dict(state)
+        print(f"Loaded trained model weights from {model_path}.")
     except Exception as e:
-        print(f"Could not load {path}, using random init ({e})")
-    model.to(dev).eval()
+        print(f"Failed to load weights from {model_path}. Using randomly initialized model. ({e})")
+    model.to(device)
+    model.eval()
     return model
 
-def interactive_loop(model, tokenizer, cfg):
-    print("Type a message; 'bye' to exit.")
+def interactive_loop(model, tokenizer, config):
+    seq_len = config.get("text_seq_len", 32)
+    print("Interactive mode. Type your message.\nCommands:\n  'build_script: <script_name>'\n  'execute_script: <script_name>'\nType 'bye' to exit.")
     while True:
-        msg = input("You: ").strip()
-        if msg.lower()=="bye":
+        user_input = input("You: ").strip()
+        if user_input.lower() == "bye":
+            print("Shutting down. Goodbye!")
             break
-        if msg.startswith("build_script:"):
-            out = model.call_function("build_script", msg.split(":",1)[1].strip())
-            print("Model:", out); continue
-        if msg.startswith("execute_script:"):
-            out = model.call_function("execute_script", msg.split(":",1)[1].strip())
-            print("Model:", out); continue
+        if user_input.startswith("build_script:"):
+            script_name = user_input.split("build_script:", 1)[1].strip()
+            result = model.call_function("build_script", script_name)
+            print("Model:", result)
+            continue
+        if user_input.startswith("execute_script:"):
+            script_name = user_input.split("execute_script:", 1)[1].strip()
+            result = model.call_function("execute_script", script_name)
+            print("Model:", result)
+            continue
 
-        ids = tokenizer.tokenize(msg)
-        t   = torch.tensor(ids, dtype=torch.long).unsqueeze(0).to(model.device)
-        dummy_audio = torch.zeros(1, cfg["audio_output_length"]).to(model.device)
-        dummy_image = torch.zeros(1,3,64,64).to(model.device)
-        dummy_video = torch.zeros(1,3,cfg["video_num_frames"],64,64).to(model.device)
+        token_ids = tokenizer.tokenize(user_input)
+        text_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(model.device)
+        dummy_audio = torch.zeros(1, config["audio_output_length"]).to(model.device)
+        dummy_image = torch.zeros(1, 3, *config.get("image_size", (64,64))).to(model.device)
+        dummy_video = torch.zeros(1, 3, config.get("video_num_frames",16), *config.get("video_frame_size",(64,64))).to(model.device)
 
-        inp = {"text":t, "query":t, "audio":dummy_audio, "image":dummy_image, "video":dummy_video}
+        inputs = {
+            "text": text_tensor,
+            "query": text_tensor,
+            "audio": dummy_audio,
+            "image": dummy_image,
+            "video": dummy_video
+        }
         with torch.no_grad():
-            out = model(inp)
-            resp = out.get("cot_out", t).cpu().numpy()[0]
-        print("Model:", tokenizer.detokenize(resp))
+            outputs = model(inputs)
+            response_embedding = outputs.get("cot_out", text_tensor)
+
+        response = tokenizer.detokenize(response_embedding.cpu().tolist()[0])
+        print("Model:", response)
 
 def main():
-    cfg = get_default_config()
-    tk  = SimpleTokenizer(max_vocab_size=cfg["text_vocab_size"])
-    tk.fit_on_texts(["init vocabulary"])
-    mdl = load_model(cfg)
-    interactive_loop(mdl, tk, cfg)
+    config = get_default_config()
+    tokenizer = SimpleTokenizer(max_vocab_size=config["text_vocab_size"])
+    tokenizer.fit_on_texts(["this is an example to build the tokenizer vocabulary"])
+    model = load_model(config)
+    interactive_loop(model, tokenizer, config)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
